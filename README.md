@@ -80,8 +80,8 @@ cp config.example.yaml config.yaml
 #### `output` - Output Configuration
 - `csv_filename`: Output CSV filename (default: `clinical_trials_filtered.csv`)
 
-#### `tuning_trials` - Trial IDs for Testing
-- List of NCT IDs to use for testing/debugging AI prompts
+#### `tuning_trials` - Trial IDs for Tuning AI Prompts
+- List of NCT IDs to limit AI processing to, for use while tuning new AI prompts
 
 ## Usage
 
