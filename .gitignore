@@ -14,8 +14,12 @@ ENV/
 # Data files
 *.csv
 *.json
+!config.example.yaml
 *.xlsx
 *.xls
+
+# Config files (may contain sensitive info)
+config.yaml
 
 # IDE
 .vscode/
