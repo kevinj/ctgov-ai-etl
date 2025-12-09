@@ -313,10 +313,6 @@ def process_study_with_ai(model: genai.GenerativeModel, study_data: Dict[str, An
     Returns:
         Optional[str]: AI-determined value or None if failed
     """
-    ai_config = CONFIG.get('ai_processing', {})
-    if not ai_config.get('enabled', True):
-        return None
-    
     # Format the row prompt with study data
     gemini_config = CONFIG.get('gemini', {})
     row_prompt_template = gemini_config.get('row_prompt_template', '')
@@ -347,16 +343,14 @@ def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, A
     Returns:
         List[Dict[str, Any]]: Studies with AI-determined values added
     """
-    ai_config = CONFIG.get('ai_processing', {})
-    if not ai_config.get('enabled', True):
-        print("ℹ️  AI processing is disabled")
-        return studies
-    
     # Initialize model with system instruction (context set once)
     model = initialize_gemini()
     if not model:
-        print("⚠️  Skipping AI processing due to initialization failure")
-        return studies
+        print("❌ Failed to initialize Gemini API. AI processing is required.")
+        sys.exit(1)
+    
+    # Get AI processing configuration
+    ai_config = CONFIG.get('ai_processing', {})
     
     # Determine which studies to process
     max_ai_rows = ai_config.get('max_rows')
@@ -515,10 +509,8 @@ def main():
         print("❌ No studies after transformation")
         sys.exit(1)
     
-    # TRANSFORM: Apply AI transformation (if enabled)
-    ai_config = CONFIG.get('ai_processing', {})
-    if ai_config.get('enabled', True):
-        transformed_studies = transform_studies_with_ai(transformed_studies)
+    # TRANSFORM: Apply AI transformation
+    transformed_studies = transform_studies_with_ai(transformed_studies)
     
     # LOAD: Save transformed studies to CSV
     load_to_csv(transformed_studies)

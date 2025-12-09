@@ -7,7 +7,7 @@ An Extract, Transform, Load (ETL) pipeline for fetching clinical trial data from
 This ETL pipeline follows a three-phase process:
 
 1. **EXTRACT**: Fetches clinical trial data from the ClinicalTrials.gov API v2
-2. **TRANSFORM**: Converts raw API responses into structured data and optionally applies AI-powered classification
+2. **TRANSFORM**: Converts raw API responses into structured data and applies AI-powered classification
 3. **LOAD**: Saves the transformed data to a CSV file
 
 ## Features
@@ -19,7 +19,7 @@ This ETL pipeline follows a three-phase process:
 
 - **Transform Phase**:
   - Converts raw API JSON to structured format
-  - Optional AI-powered classification using Google Gemini
+  - AI-powered classification using Google Gemini
   - Configurable transformation rules
 
 - **Load Phase**:
@@ -45,7 +45,7 @@ source venv/bin/activate  # On macOS/Linux
 pip install -r requirements.txt
 ```
 
-3. Set your Gemini API key (required for AI features):
+3. Set your Gemini API key (required):
 ```bash
 export GEMINI_API_KEY="your-api-key-here"
 ```
@@ -73,7 +73,6 @@ cp config.example.yaml config.yaml
 - `row_prompt_template`: Template for per-row AI prompts (multiline YAML with placeholders)
 
 #### `ai_processing` - AI Processing Options
-- `enabled`: Enable/disable AI processing (default: `true`)
 - `column_name`: Name of the AI-determined column (default: `ai_determined_value`)
 - `max_rows`: Limit number of rows processed by AI (set to `null` for all)
 - `debug_only_tuning_trials`: Process only trials listed in `tuning_trials` (default: `false`)
@@ -101,7 +100,7 @@ python3 etl.py --config my_config.yaml
 ### ETL Process Flow
 
 1. **Extract**: The pipeline fetches all studies matching your filter criteria from the API
-2. **Transform**: Each study is converted to structured format, and optionally processed with AI
+2. **Transform**: Each study is converted to structured format and processed with AI classification
 3. **Load**: All transformed studies are saved to the configured CSV file
 
 ## Output
@@ -119,7 +118,7 @@ The pipeline generates a CSV file with the following columns:
 - `brief_summary`: Brief summary of the study
 - `detailed_description`: Detailed description
 - `criteria`: Eligibility criteria
-- `ai_determined_value`: AI classification result (if AI processing is enabled)
+- `ai_determined_value`: AI classification result
 
 The AI column name can be customized via the `ai_processing.column_name` configuration option.
 
