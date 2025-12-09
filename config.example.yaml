@@ -58,7 +58,7 @@ ai_processing:
 
 
 output:
-  csv_filename: clinical_trials_filtered.csv
+  csv_filename: clinical_trials_processed.csv
 
 tuning_trials:
   - NCT06695221
