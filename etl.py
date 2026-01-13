@@ -460,11 +460,27 @@ def load_to_csv(studies: List[Dict[str, Any]], filename: Optional[str] = None) -
         fieldnames.append(ai_column_name)
     
     try:
-        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(studies)
-        print(f"\n💾 Data saved to: {filename}")
+        max_rows = output_config.get('max_rows_per_file', 3000)
+
+        # Split studies into chunks
+        total_studies = len(studies)
+        for i in range(0, total_studies, max_rows):
+            chunk = studies[i:i + max_rows]
+
+            # Determine filename for this chunk
+            if i == 0:
+                current_filename = filename
+            else:
+                base, ext = os.path.splitext(filename)
+                iteration = i // max_rows
+                current_filename = f"{base}_{iteration}{ext}"
+
+            with open(current_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(chunk)
+            print(f"\n💾 Data saved to: {current_filename} ({len(chunk)} rows)")
+
     except Exception as e:
         print(f"❌ Failed to save CSV: {e}")
 
