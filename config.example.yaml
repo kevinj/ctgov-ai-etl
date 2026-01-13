@@ -9,7 +9,7 @@ ctgov:
     - (AREA[MaximumAge]RANGE[18 Years,MAX] OR AREA[MaximumAge]MISSING)
     - (AREA[MinimumAge]RANGE[MIN,64 Years] OR AREA[MinimumAge]MISSING)
     - (AREA[Phase]EARLY_PHASE1 OR AREA[Phase]PHASE1 OR AREA[Phase]PHASE2 OR AREA[Phase]PHASE3 OR AREA[Phase]PHASE4)
-    - (SEARCH[Study]pregnant OR SEARCH[Study]pregnancy)
+    - (AREA[InterventionType]BIOLOGICAL OR AREA[InterventionType]DRUG)
 
 gemini:
   api_key_env: GEMINI_API_KEY
@@ -59,6 +59,7 @@ ai_processing:
 
 output:
   csv_filename: clinical_trials_processed.csv
+  max_rows_per_file: 3000
 
 tuning_trials:
   - NCT06695221
