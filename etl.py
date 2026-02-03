@@ -268,31 +268,26 @@ def initialize_gemini_models() -> Dict[str, genai.GenerativeModel]:
         models = {}
         
         # If columns are defined, create a model for each
-        if columns:
-            for col_config in columns:
-                col_name = col_config.get('name')
-                system_instruction = col_config.get('system_instruction', '')
+        if (not columns):
+            print("❌ No columns to process. AI processing is required.")
+            sys.exit(1)
+            
+        for col in columns:
+            col_name = col.get('name')
+            if (not col_name):
+                print(f"❌ Column name is required. Column: {col}")
+                sys.exit(1)
                 
-                if col_name:
-                    model = genai.GenerativeModel(
-                        model_name,
-                        system_instruction=system_instruction
-                    )
-                    models[col_name] = model
-                    print(f"✅ Initialized model for column '{col_name}'")
-        
-        # Fallback: if no columns defined, use legacy single column approach
-        if not models:
-            system_instruction = ai_config.get('system_instruction', '')
+            system_instruction = col.get('system_instruction', '')
+            
             model = genai.GenerativeModel(
                 model_name,
                 system_instruction=system_instruction
             )
-            ai_column_name = ai_config.get('column_name', 'ai_determined_value')
-            models[ai_column_name] = model
-            print(f"✅ Gemini API initialized (model: {model_name}) - single column mode")
-        else:
-            print(f"✅ Gemini API initialized (model: {model_name}) - {len(models)} columns")
+            models[col_name] = model
+            print(f"✅ Initialized model for column '{col_name}'")
+        
+        print(f"✅ Gemini API initialized (model: {model_name}) - {len(models)} columns")
         
         return models
         
@@ -318,7 +313,7 @@ def get_gemini_response(model: genai.GenerativeModel, row_prompt: str) -> Option
     try:
         # Model already has system instruction (context), just send the row prompt
         response = model.generate_content(row_prompt)
-        
+
         # Extract text from response
         if response and response.text:
             return response.text.strip()
