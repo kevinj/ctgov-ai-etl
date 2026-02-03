@@ -233,44 +233,72 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
 # GEMINI AI FUNCTIONS (for transformation)
 # ============================================================================
 
-def initialize_gemini() -> Optional[genai.GenerativeModel]:
+def initialize_gemini_models() -> Dict[str, genai.GenerativeModel]:
     """
-    Initialize Gemini API client with system instruction.
+    Initialize Gemini API client with multiple models, one per column.
+    Each model has its own system instruction.
     
     Returns:
-        Optional[genai.GenerativeModel]: Initialized model with system instruction, or None if failed
+        Dict[str, genai.GenerativeModel]: Dictionary mapping column names to models
     """
     global _ACTUAL_GEMINI_MODEL
     
     if not GEMINI_AVAILABLE:
         print("❌ Gemini library not available")
-        return None
+        return {}
     
-    gemini_config = CONFIG.get('gemini', {})
-    api_key_env = gemini_config.get('api_key_env', 'GEMINI_API_KEY')
+    ai_config = CONFIG.get('ai_processing', {})
+    api_key_env = ai_config.get('api_key_env', 'GEMINI_API_KEY')
     gemini_api_key = os.getenv(api_key_env, '')
     
     if not gemini_api_key:
         print(f"❌ {api_key_env} environment variable not set")
         print(f"   Set it with: export {api_key_env}='your-api-key'")
-        return None
+        return {}
     
     try:
         genai.configure(api_key=gemini_api_key)
-        # Create model with system instruction (context set once)
-        model_name = gemini_config.get('model')
-        system_instruction = gemini_config.get('system_instruction', '')
-        model = genai.GenerativeModel(
-            model_name,
-            system_instruction=system_instruction
-        )
-        print(f"✅ Gemini API initialized (model: {model_name})")
-        print(f"   System instruction set (context loaded once)")
+        model_name = ai_config.get('model', 'gemini-2.5-flash')
         _ACTUAL_GEMINI_MODEL = model_name
-        return model
+        
+        # Get column configurations
+        ai_config = CONFIG.get('ai_processing', {})
+        columns = ai_config.get('columns', [])
+        
+        models = {}
+        
+        # If columns are defined, create a model for each
+        if columns:
+            for col_config in columns:
+                col_name = col_config.get('name')
+                system_instruction = col_config.get('system_instruction', '')
+                
+                if col_name:
+                    model = genai.GenerativeModel(
+                        model_name,
+                        system_instruction=system_instruction
+                    )
+                    models[col_name] = model
+                    print(f"✅ Initialized model for column '{col_name}'")
+        
+        # Fallback: if no columns defined, use legacy single column approach
+        if not models:
+            system_instruction = ai_config.get('system_instruction', '')
+            model = genai.GenerativeModel(
+                model_name,
+                system_instruction=system_instruction
+            )
+            ai_column_name = ai_config.get('column_name', 'ai_determined_value')
+            models[ai_column_name] = model
+            print(f"✅ Gemini API initialized (model: {model_name}) - single column mode")
+        else:
+            print(f"✅ Gemini API initialized (model: {model_name}) - {len(models)} columns")
+        
+        return models
+        
     except Exception as e:
         print(f"❌ Failed to initialize Gemini API: {e}")
-        return None
+        return {}
 
 
 def get_gemini_response(model: genai.GenerativeModel, row_prompt: str) -> Optional[str]:
@@ -314,19 +342,15 @@ def process_study_with_ai(model: genai.GenerativeModel, study_data: Dict[str, An
         Optional[str]: AI-determined value or None if failed
     """
     # Format the row prompt with study data
-    gemini_config = CONFIG.get('gemini', {})
-    row_prompt_template = gemini_config.get('row_prompt_template', '')
-    try:
-        row_prompt = row_prompt_template.format(**study_data)
-    except KeyError as e:
-        print(f"⚠️  Missing field in prompt template: {e}")
-        return None
-    
+    ai_config = CONFIG.get('ai_processing', {})
+    row_prompt_template = ai_config.get('row_prompt_template', '')
+    row_prompt = row_prompt_template.format(**study_data)
+
     # Get AI response (context already set via system instruction)
     result = get_gemini_response(model, row_prompt)
     
     # Add small delay to respect rate limits
-    api_delay = gemini_config.get('api_delay', 0.5)
+    api_delay = ai_config.get('api_delay', 0.5)
     if api_delay > 0:
         time.sleep(api_delay)
     
@@ -335,7 +359,7 @@ def process_study_with_ai(model: genai.GenerativeModel, study_data: Dict[str, An
 
 def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Transform studies by adding AI-determined column values.
+    Transform studies by adding AI-determined column values for all configured columns.
     
     Args:
         studies (List[Dict[str, Any]]): List of study data dictionaries
@@ -343,15 +367,18 @@ def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, A
     Returns:
         List[Dict[str, Any]]: Studies with AI-determined values added
     """
-    # Initialize model with system instruction (context set once)
-    model = initialize_gemini()
-    if not model:
+    # Initialize models for all columns
+    models = initialize_gemini_models()
+    if not models:
         print("❌ Failed to initialize Gemini API. AI processing is required.")
         sys.exit(1)
     
-    # Get AI processing configuration
     ai_config = CONFIG.get('ai_processing', {})
-    
+    columns = ai_config.get('columns', [])
+    if (not columns):
+        print("❌ No columns to process. AI processing is required.")
+        sys.exit(1)
+        
     # Determine which studies to process
     max_ai_rows = ai_config.get('max_rows')
     if max_ai_rows is None:
@@ -368,55 +395,51 @@ def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, A
         tuning_trials = CONFIG.get('tuning_trials', [])
         tuning_trials_set = set(tuning_trials)
         original_count = len(studies_to_process)
-        # Separate studies into tuning trials and others
         filtered_tuning = [s for s in studies_to_process if s.get('nct_id') in tuning_trials_set]
         filtered_out = [s for s in studies_to_process if s.get('nct_id') not in tuning_trials_set]
         studies_to_process = filtered_tuning
-        # Add filtered-out studies to remaining_studies
         remaining_studies.extend(filtered_out)
         if original_count != len(studies_to_process):
             print(f"🔍 Debug mode: Filtered to {len(studies_to_process)} tuning trials (from {original_count} studies)")
     
-    ai_column_name = ai_config.get('column_name', 'ai_determined_value')
-    gemini_config = CONFIG.get('gemini', {})
-    model_name = gemini_config.get('model', 'gemini-2.5-flash')
+    ai_config = CONFIG.get('ai_processing', {})
+    model_name = ai_config.get('model', 'gemini-2.5-flash')
     
+    total_studies = len(studies_to_process)
     print(f"\n🤖 Transforming {len(studies_to_process)} studies with Gemini AI ({limit_msg} studies)...")
     print(f"   Model: {model_name}")
-    print(f"   Column: {ai_column_name}")
     print("-" * 60)
     
     processed_studies = []
-    success_count = 0
-    error_count = 0
-    total_studies = len(studies_to_process)
-    
+
     for i, study in enumerate(studies_to_process):
         nct_id = study.get('nct_id', 'Unknown')
-        print(f"  [{i+1}/{total_studies}] Transforming {nct_id} with Gemini AI...", end=' ', flush=True)
+        print(f"  [{i+1}/{total_studies}] Processing {nct_id}...", end=' ', flush=True)
         
-        ai_value = process_study_with_ai(model, study)
+        all_success = True
+        for col in columns:
+            col_name = col.get('name')
+            if (not col_name):
+                print(f"❌ Column name is required. Column: {col}")
+                sys.exit(1)
+
+            model = models[col_name]
+            ai_value = process_study_with_ai(model, study)
+            study[col_name] = ai_value
         
-        if ai_value:
-            study[ai_column_name] = ai_value
-            success_count += 1
-            print("✓")
-        else:
-            study[ai_column_name] = 'N/A'
-            error_count += 1
-            print("✗")
+        print("✓")
         
         processed_studies.append(study)
     
-    # Add remaining studies without AI transformation (set AI column to 'N/A')
+    # Add remaining studies without AI transformation
     for study in remaining_studies:
-        study[ai_column_name] = 'N/A'
+        for col in columns:
+            col_name = col.get('name')
+            study[col_name] = 'N/A'
         processed_studies.append(study)
     
     print(f"\n✅ AI transformation complete:")
     print(f"   Processed with AI: {len(studies_to_process)} studies")
-    print(f"   Successful: {success_count}/{len(studies_to_process)}")
-    print(f"   Errors: {error_count}/{len(studies_to_process)}")
     if remaining_studies:
         print(f"   Remaining {len(remaining_studies)} studies set to 'N/A'")
     
@@ -453,13 +476,18 @@ def load_to_csv(studies: List[Dict[str, Any]], filename: Optional[str] = None) -
         'start_year'
     ]
     
-    # Add AI column if it exists in any study
+    # Add all AI columns from config
     ai_config = CONFIG.get('ai_processing', {})
-    ai_column_name = ai_config.get('column_name', 'ai_determined_value')
-    if studies and ai_column_name in studies[0]:
-        fieldnames.append(ai_column_name)
+    columns = ai_config.get('columns', [])
+    
+    if columns:
+        for col_config in columns:
+            col_name = col_config.get('name')
+            if col_name and col_name not in fieldnames:
+                fieldnames.append(col_name)
     
     try:
+        output_config = CONFIG.get('output', {})
         max_rows = output_config.get('max_rows_per_file', 3000)
 
         # Split studies into chunks
