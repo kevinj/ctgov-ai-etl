@@ -1,0 +1,214 @@
+ctgov:
+  api_url: https://clinicaltrials.gov/api/v2/studies
+  page_size: 1000
+  filter_advanced:
+    - AREA[StudyType]INTERVENTIONAL
+    - AREA[StartDate]RANGE[2013-05-01,2024-12-31]
+    - SEARCH[Location](AREA[LocationCountry]Canada)
+    - (AREA[Sex]FEMALE OR AREA[Sex]ALL)
+    - (AREA[MaximumAge]RANGE[18 Years,MAX] OR AREA[MaximumAge]MISSING)
+    - (AREA[MinimumAge]RANGE[MIN,64 Years] OR AREA[MinimumAge]MISSING)
+    - (AREA[Phase]EARLY_PHASE1 OR AREA[Phase]PHASE1 OR AREA[Phase]PHASE2 OR AREA[Phase]PHASE3 OR AREA[Phase]PHASE4)
+    - (AREA[InterventionType]BIOLOGICAL OR AREA[InterventionType]DRUG)
+
+health_canada_api:
+  product_url: https://health-products.canada.ca/api/drug/drugproduct/?lang=en&type=json
+  status_url: https://health-products.canada.ca/api/drug/status/?lang=en&type=json
+
+fda_api:
+  label_url: https://api.fda.gov/drug/label.json
+
+ai_processing:
+  enabled: true
+  api_key_env: GEMINI_API_KEY
+  model: gemini-2.5-flash
+  api_delay: 0.5
+  max_rows: 1000
+  debug_only_tuning_trials: TRUE
+  row_prompt_template: |
+    Analyze the following clinical trial study:
+
+    NCT ID: {nct_id}
+    Title: {brief_title}
+    Official Title: {official_title}
+    Summary: {brief_summary}
+    Phase: {phase}
+    Enrollment: {enrollment}
+    Results Link: {results_link}
+    Location: {location}
+    Detailed Description: {detailed_description}
+    Eligibility Criteria: {criteria}
+    
+    Interventions:
+    {intervention_descriptions}
+
+    Trial Sites:
+    {sites_detail}
+
+    External Publications (CT.gov):
+    {publications}
+
+    Published Literature (PubMed Search):
+    {pubmed_publications}
+
+    FDA Drug API (Approval Status):
+    {FDA Approved Status}
+    
+    FDA Drug API (Pregnancy & Lactation Safety):
+    {FDA Pregnancy & Lactation Safety}
+
+    Health Canada DPD API (Approval Status):
+    {Health Canada Approval}
+    
+    Health Canada DPD API (Pregnancy & Lactation Safety):
+    {Health Canada Pregnancy & Lactation Safety}
+  columns:
+    -
+      name: pregnancy_classification
+      system_instruction: |
+        You will be analyzing information about clinical trials, including the eligibility criteria.
+        I want you to classify these trials into one of the following categories:
+
+        ONLY_PREGNANCY: All study participants must be pregnant
+        INCLUDE_PREGNANCY: Includes pregnant participants
+        EXCLUDE_PREGNANCY: Explicitly excludes pregnant participants or requires participants to use contraception
+        POSTPARTUM: All study participants must be postpartum
+        FERTILITY: All study participants must be trying to get pregnant, but are not pregnant yet.
+        NOT MENTIONED: The criteria does not mention whether pregnant, postpartum, or fertility participants are included or excluded.
+
+        I am going to provide an example of what it often, but not always looks like, demarcated by '==='.
+        You will be provided with examples of criteria and their classifications, then you will classify new criteria.
+
+        Example 1: === Inclusion Criteria:... Women of childbearing potential need a negative pregnancy test; Exclusion Criteria: Pregnant at enrollment; women who are pregnant; currently pregnant; pregnant or; positive pregnancy test; positive serum pregnancy test; pregnancy; positive urine pregnancy test ... === EXCLUDE_PREGNANCY 'Pregnant';
+        Example 2: === Inclusion Criteria: pregnant at enrollment; pregnancy; positive pregnancy test; positive serum pregnancy test; active labor; negative pregnancy test; negative urine pregnancy test; serum pregnancy test must be negative ... Exclusion Criteria: ... === INCLUDE_PREGNANCY 'pregnant at enrollment';
+        Example 3: === Inclusion Criteria: (no mention of pregnancy) ... Exclusion Criteria: ... (no mention of pregnancy) === NOT_MENTIONED;
+        Example 4: === Inclusion Criteria: negative serum pregnancy test; pregnancy test is negative; serum pregnancy test must be negative ... Exclusion Criteria: Positive pregnancy test; trying to get pregnant... === EXCLUDE_PREGNANCY 'negative pregnancy test';
+        Example 5: === Inclusion Criteria: postpartum... Exclusion Criteria:... === POSTPARTUM 'postpartum';
+        Example 6: === Inclusion Criteria: trying to get pregnant... Exclusion Criteria:... === FERTILITY 'trying to get pregnant';
+
+        You are to output the outcome of the classification (Only the category name, not the full text of the category),
+        and then quote the part of the criteria that gave you confidence as to the result.
+    - 
+      name: lactation_classification
+      system_instruction: |
+        You will be analyzing information about clinical trials, including the eligibility criteria. 
+        I want you to classify these trials into one of the following categories:
+
+        ONLY_LACTATION: All study participants must be lactating.
+        INCLUDE LACTATION: Includes lactating participants.
+        EXCLUDE_LACTATION: Explicitly excludes lactating participants.
+        POSTPARTUM_ONLY: All study participants must be postpartum but lactation is excluded or not mentioned.
+        NOT_MENTIONED: The criteria does not mention whether lactating or postpartum participants are included or excluded.
+
+        I am going to provide an example of what it often, but not always looks like, demarcated by "===".
+        You will be provded with examples of criteria and their classifications, then you will classify new criteria.
+
+        Example 1: === Inclusion Criteria:... breastfeeding; chestfeeding; lactating or lactation; nursing ... === EXCLUSION 'breastfeeding'; 
+        Example 2: === Inclusion Criteria: breastfeeding; chestfeeding; lactating or lactation; nursing ... Exclusion Criteria: ...=== INCLUSION 'breastfeeding'; 
+        Example 3: === Inclusion Criteria: (no mention of breastfeeding) ... Exclusion Criteria: ... (no mention of breastfeeding) === 'NOT MENTIONED'; 
+        Example 4: === Inclusion Criteria: postpartum... Exclusion Criteria: breastfeeding; lactating or lactation; chestfeeding; nursing ... === POSTPARTUM_ONLY 'postpartum without breastfeeding'; 
+
+
+        You are to output the outcome of the classification (Only the category name, not the full text of the category), 
+        and then quote the part of the criteria that gave you confidence as to the result. 
+    - 
+      name: contraception_classification
+      system_instruction: |
+        You will be analyzing information about clinical trials, including the eligibility criteria. 
+        When the trial requires the participant to use contraception, output "REQUIRED".
+        When the trial does not require the participant use contraception, output "NOT_REQUIRED".
+        When the trial doe not mention contracption, output "NOT_MENTIONED". 
+        
+
+    - 
+      name: Applicable
+      system_instruction: |
+        You will be analyzing information about clinical trials, including the eligibility criteria.
+        I want you to classify when this trial is not applicable to adult women between the ages of 18 to 55.
+        When the trial includes: only male participants output "WRONG_COHORT".
+        When the trial includes: only older adults participants (older than 55) output "WRONG_COHORT".
+        When the trial includes: only pediatric participants (younger than 18) output "WRONG_COHORT".
+        When for all other trials: output "TRUE".
+
+        You are to output the outcome of the classification (Only the category name, not the full text of the category),
+        and then state the criteria that gave you the confidence as to the result.
+
+    - 
+      name: Intervention
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        Determine if the intervention used in this trial is a drug, biologic, or vaccine. 
+        You are to output the type of intervention (drug, vaccine or biologic). 
+
+
+    - 
+      name: Condition
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        Determine the name of the condition being studied in this trial. 
+        You are to output the name of the condition (only the name),
+        and then the type of disorder in parenthesis.
+   
+    - 
+      name: Trial_Sites
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        Determine the number of trial sites in each country.
+        Output the names of the countries where there are trial sites, 
+        and then for each country, output the number of sites in that country in parenthesis. 
+
+    - 
+      name: Additional_Eligibility_Needed
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        I want want you to determine if readers need to refer to the full protocol to determine eligibility for this trial.
+        If the eligibility criteria are fully stated in the trial record, output "FALSE".
+        If the eligibility criteria specifies to refer to the protocol for additional eligibility information, output "TRUE", 
+        and provide a quote from the eligibility criteria that supports your decision in parenthesis.
+
+    - 
+      name: Special_Circumstances
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        I want you to identify trials that typically exclude pregnant or lactating participants but include specific exceptions or "special circumstances" where they may be allowed (e.g., "unless the investigator determines the benefit outweighs the risk," "except in cases where...", or specific criteria that allows for inclusion despite a general exclusion).
+        This is for finding nuance in trials that are not specifically targeted at pregnant populations.
+        If a specific exception to a general exclusion for pregnancy or lactation is found, output "TRUE" and provide the supporting quote in parentheses.
+        Otherwise, output "FALSE".
+
+        
+
+output:
+  csv_filename: clinical_trials_processed-test.feb-18.csv
+  max_rows_per_file: 3000
+
+tuning_trials:
+  
+  - NCT01972217
+  - NCT02531516
+  - NCT02624089
+  - NCT06794723
+  - NCT04235140
+  - NCT07097012
+  - NCT06111235
+  - NCT01985425
+  - NCT06942208
+  - NCT06242977
+  - NCT07066631
+  - NCT03739684
+  - NCT07084298
+  - NCT04060043
+  - NCT06954701
+  - NCT06052306
+  - NCT02196467
+  - NCT03392051
+  - NCT06920537
+  - NCT04289142
+  - NCT07065461
+  - NCT02508194
+  - NCT05731960
+  - NCT04940078
+  - NCT02429791
+  - 
+
+
+
