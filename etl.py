@@ -255,167 +255,188 @@ def fetch_pubmed_publications(nct_id: str) -> str:
 # HEALTH CANADA API
 # ============================================================================
 
-@lru_cache(maxsize=1)
-def load_hc_data():
-    """Load and cache Health Canada Drug Product and Status data."""
-    print("  Fetching Health Canada product database...")
-    
+# Dosage-form terms that appear in Health Canada drugproduct brand_name/descriptor
+# (activeingredient uses INN names + dosage_unit codes like TAB/CAP/ML, not "cream"/"ointment")
+HC_FORMULATION_WORDS = frozenset({
+    'aerosol', 'caplet', 'caplets', 'capsule', 'capsules', 'cream', 'drops',
+    'emulsion', 'film', 'foam', 'gel', 'granules', 'inhalation', 'inhaler',
+    'injectable', 'injection', 'lotion', 'lozenge', 'lozenges', 'ointment',
+    'paste', 'patch', 'powder', 'solution', 'spray', 'suppositories', 'suppository',
+    'suspension', 'syrup', 'tablet', 'tablets',
+})
+# dosage_unit codes from activeingredient (e.g. TAB, CAP, LOZ) — strip if trailing token
+HC_DOSAGE_UNIT_CODES = frozenset({
+    'amp', 'cap', 'drop', 'film', 'loz', 'pad', 'spray', 'sup', 'syr', 'tab',
+    'vial', 'vtab', 'waf',
+})
+
+
+def hc_ingredient_search_name(clean_name: str) -> str:
+    """Strip dose/strength and dosage-form words for Health Canada ingredient lookup."""
+    name = re.sub(
+        r'\s+\d+(\.\d+)?\s*(%|mg|mcg|μg|ug|g|ml|l|iu|units?)(?:/\w+)?\b.*$',
+        '',
+        clean_name,
+        flags=re.I,
+    ).strip()
+    words = name.split()
+    while words:
+        token = words[-1].lower().rstrip('.')
+        if token in HC_FORMULATION_WORDS or token in HC_DOSAGE_UNIT_CODES:
+            words.pop()
+        else:
+            break
+    name = ' '.join(words).strip()
+    return name or clean_name
+
+
+def _hc_api_urls():
     hc_config = CONFIG.get('health_canada_api', {})
-    prod_url = hc_config.get('product_url', "https://health-products.canada.ca/api/drug/drugproduct/?lang=en&type=json")
-    status_url = hc_config.get('status_url', "https://health-products.canada.ca/api/drug/status/?lang=en&type=json")
-    active_url = "https://health-products.canada.ca/api/drug/activeingredient/?lang=en&type=json"
-    
+    base = hc_config.get('base_url', 'https://health-products.canada.ca')
+    return (
+        hc_config.get('active_ingredient_url', f'{base}/api/drug/activeingredient/'),
+        hc_config.get('status_url', f'{base}/api/drug/status/'),
+    )
+
+
+@lru_cache(maxsize=512)
+def fetch_hc_active_ingredients(ingredient_name: str):
+    active_url, _ = _hc_api_urls()
     try:
-        prods = requests.get(prod_url, timeout=30).json()
-        statuses = requests.get(status_url, timeout=30).json()
-        active = requests.get(active_url, timeout=30).json()
-        
-        status_map = {}
-        for s in statuses:
-            status_map[s['drug_code']] = s
-            
-        # Create a mapping from drug_code to active ingredient names
-        active_map = {}
-        for a in active:
-            dc = a.get('drug_code')
-            if dc:
-                if dc not in active_map:
-                    active_map[dc] = []
-                active_map[dc].append(a.get('ingredient_name', '').lower())
-            
-        return prods, status_map, active_map
+        r = requests.get(
+            active_url,
+            params={'ingredientname': ingredient_name, 'lang': 'en', 'type': 'json'},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
     except Exception as e:
-        print(f"⚠️ Warning: Failed to fetch Health Canada data: {e}")
-        return [], {}, {}
+        print(f"⚠️ Warning: Health Canada active ingredient fetch failed for {ingredient_name}: {e}")
+        return None
+
+
+@lru_cache(maxsize=512)
+def fetch_hc_status(drug_code: int):
+    _, status_url = _hc_api_urls()
+    try:
+        r = requests.get(
+            status_url,
+            params={'id': drug_code, 'lang': 'en', 'type': 'json'},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+        return None
+    except Exception as e:
+        print(f"⚠️ Warning: Health Canada status fetch failed for drug_code {drug_code}: {e}")
+        return None
+
+
+def _hc_strength_label(entry: dict) -> Optional[str]:
+    strength = (entry.get('strength') or '').strip()
+    unit = (entry.get('strength_unit') or '').strip()
+    if strength and unit:
+        return f"{strength} {unit}"
+    return strength or None
+
+
+def _hc_approval_year(statuses: List[dict]) -> Optional[str]:
+    """Earliest original_market_date year from approved/marketed status records."""
+    years = []
+    for st in statuses:
+        if st.get('status', '').lower() not in ('approved', 'marketed'):
+            continue
+        date_str = st.get('original_market_date') or ''
+        if date_str and len(date_str) >= 4:
+            years.append(date_str[:4])
+    return min(years) if years else None
+
 
 def fetch_health_canada_approval(interventions: List[str]) -> str:
     """Check each intervention against Health Canada database."""
     if not interventions:
         return "N/A"
-        
-    prods, status_map, active_map = load_hc_data()
-    if not prods:
-        return "N/A (API fetch failed)"
-        
-    checks = []
-    
-    # Overrides for specific interventions that are known to be approved
-    # either because they are NHPs not in DPD, or specifically requested
-    overrides = {
-        'nigella': ('APPROVED', 'Unknown', 'Manual Override (NHP)'),
-        'nigella sativa': ('APPROVED', 'Unknown', 'Manual Override (NHP)')
-    }
-    
+
+    print(f"Health Canada lookup interventions: {interventions}")
+
+    search_names: List[str] = []
+    seen = set()
     for intv in interventions:
-        if not intv or intv == 'N/A': continue
-        
+        if not intv or intv == 'N/A':
+            continue
         clean_name = re.sub(r'^[^:]+:\s*', '', intv).strip().lower()
-        if not clean_name: continue
-        
-        approved = False
-        year = "Unknown"
-        reason = "Not found in database"
-        
-        brand_map = {
-            'covid 19': ['comirnaty', 'spikevax', 'vaxzevria', 'nuvaxovid'],
-            'coronavirus': ['comirnaty', 'spikevax', 'vaxzevria', 'nuvaxovid'],
-            'sars cov 2': ['comirnaty', 'spikevax', 'vaxzevria', 'nuvaxovid'],
-            'menacwy': ['menactra', 'menveo', 'nimenrix', 'menquadfi'],
-            'meningococcal': ['menactra', 'menveo', 'nimenrix', 'menquadfi', 'bexsero', 'trumenba'],
-            'pneumococcal': ['prevnar', 'pneumovax', 'vaxneuvance', 'apexicon'],
-            'hpv': ['gardasil', 'cervarix'],
-            'human papillomavirus': ['gardasil', 'cervarix'],
-            'pentavalent': ['rotateq', 'pediacel', 'pentacel'],
-            'abatacept': ['orencia'],
-            'bcg': ['bcg', 'oncotice']
-        }
-        
-        search_terms = [clean_name.replace('-', ' ')]
-        for k, v in brand_map.items():
-            if k in search_terms[0]:
-                search_terms.extend(v)
-        
-        # Check overrides first
-        override_match = False
-        for k in overrides:
-            if k in clean_name:
-                approved = True
-                year = overrides[k][1]
-                override_match = True
-                break
-                
-        if override_match:
-            checks.append(f"APPROVED - {clean_name} (since {year})")
+        if not clean_name:
+            continue
+        search_name = hc_ingredient_search_name(clean_name)
+        print(f"  {intv} -> {search_name}")
+        if search_name not in seen:
+            seen.add(search_name)
+            search_names.append(search_name)
+
+    checks = []
+    for search_name in search_names:
+        print(f"  Searching Health Canada for: {search_name}")
+        active = fetch_hc_active_ingredients(search_name)
+        if active is None:
+            checks.append(f"NOT APPROVED - {search_name} (API fetch failed)")
+            continue
+        if not active:
+            checks.append(f"NOT APPROVED - {search_name} (not found in database)")
             continue
 
-        for p in prods:
-            brand_name = p.get('brand_name', '').lower()
-            test_brand = brand_name.replace('-', ' ')
-            
-            # Check if any of our mapped search terms match this brand
-            matched = False
-            for term in search_terms:
-                # Match if generic name is in brand (e.g. menacwy in menacwy-d)
-                if term in test_brand:
-                    matched = True
-                    break
-                # Match if brand is in generic name (only if brand is a substantial word to avoid false positives like 'cina' matching 'vaccination')
-                if len(test_brand) >= 5 and test_brand in term:
-                    matched = True
-                    break
-                    
-            if matched:
-                drug_code = p['drug_code']
-                st = status_map.get(drug_code, {})
-                status_text = st.get('status', '').lower()
-                
-                if status_text in ['approved', 'marketed']:
-                    approved = True
-                    date_str = st.get('original_market_date') or p.get('last_update_date') or ''
-                    if date_str and len(date_str) >= 4:
-                        year = date_str[:4]
-                    break
-                else:
-                    reason = f"Status is {status_text}"
+        drug_codes = {a['drug_code'] for a in active if a.get('drug_code')}
+        approved = False
+        approved_strengths: List[str] = []
+        approval_year: Optional[str] = None
+        reason = "not found in database"
+
+        for drug_code in drug_codes:
+            statuses = fetch_hc_status(drug_code)
+            if not statuses:
+                continue
+            drug_approved = any(
+                st.get('status', '').lower() in ('approved', 'marketed')
+                for st in statuses
+            )
+            if drug_approved:
+                approved = True
+                year = _hc_approval_year(statuses)
+                if year and (approval_year is None or year < approval_year):
+                    approval_year = year
+                for entry in active:
+                    if entry.get('drug_code') != drug_code:
+                        continue
+                    label = _hc_strength_label(entry)
+                    if label and label not in approved_strengths:
+                        approved_strengths.append(label)
+            else:
+                for st in statuses:
+                    status_text = st.get('status', '').lower()
+                    if not status_text:
+                        continue
+                    reason = f"status is {status_text}"
                     if 'cancelled' in status_text:
                         cancel_date = st.get('history_date') or st.get('expiration_date') or ''
                         if cancel_date and len(cancel_date) >= 4:
                             reason += f" in {cancel_date[:4]}"
-                            
-            # If not matched by brand name, check active ingredients
-            if not matched:
-                drug_code = p['drug_code']
-                active_ingreds = active_map.get(drug_code, [])
-                for term in search_terms:
-                    for ai in active_ingreds:
-                        res_term = term.strip()
-                        if res_term in ai or (len(ai) >= 5 and ai in res_term):
-                            matched = True
-                            break
-                    if matched: break
-                            
-                if matched:
-                    st = status_map.get(drug_code, {})
-                    status_text = st.get('status', '').lower()
-                    
-                    if status_text in ['approved', 'marketed']:
-                        approved = True
-                        date_str = st.get('original_market_date') or p.get('last_update_date') or ''
-                        if date_str and len(date_str) >= 4:
-                            year = date_str[:4]
-                        break
-                    else:
-                        reason = f"Status is {status_text}"
-                        if 'cancelled' in status_text:
-                            cancel_date = st.get('history_date') or st.get('expiration_date') or ''
-                            if cancel_date and len(cancel_date) >= 4:
-                                reason += f" in {cancel_date[:4]}"
-        
+
         if approved:
-            checks.append(f"APPROVED - {clean_name} (since {year})")
+            details = []
+            if approved_strengths:
+                details.append(', '.join(approved_strengths))
+            if approval_year:
+                details.append(f"since {approval_year}")
+            suffix = f" ({'; '.join(details)})" if details else ""
+            checks.append(f"APPROVED - {search_name}{suffix}")
         else:
-            checks.append(f"NOT APPROVED - {clean_name} ({reason})")
-            
+            checks.append(f"NOT APPROVED - {search_name} ({reason})")
+
     if not checks:
         return "N/A"
     return "\n".join(checks)
@@ -730,14 +751,17 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
         is_inconsistent = False
         for line_hc in health_canada_approval_str.split('\n'):
             for line_fda in fda_status_str.split('\n'):
-                if ' - ' in line_hc and ' (' in line_hc and ' - ' in line_fda and ' (' in line_fda:
-                    name_hc = line_hc.split(' - ')[1].split(' (')[0]
-                    name_fda = line_fda.split(' - ')[1].split(' (')[0]
-                    if name_hc == name_fda:
-                        app_hc = line_hc.startswith("APPROVED")
-                        app_fda = line_fda.startswith("APPROVED")
-                        if app_hc != app_fda:
-                            is_inconsistent = True
+                if ' - ' not in line_hc or ' (' not in line_hc or ' - ' not in line_fda or ' (' not in line_fda:
+                    continue
+                name_hc = line_hc.split(' - ')[1].split(' (')[0].strip().lower()
+                name_fda = hc_ingredient_search_name(
+                    line_fda.split(' - ')[1].split(' (')[0].strip().lower()
+                )
+                if name_hc == name_fda:
+                    app_hc = line_hc.startswith("APPROVED")
+                    app_fda = line_fda.startswith("APPROVED")
+                    if app_hc != app_fda:
+                        is_inconsistent = True
         consistency_str = "Inconsistent" if is_inconsistent else "Consistent"
     
     # Outcomes
