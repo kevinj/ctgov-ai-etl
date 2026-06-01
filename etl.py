@@ -1326,7 +1326,7 @@ def load_to_csv(studies: List[Dict[str, Any]], filename: Optional[str] = None) -
                 iteration = i // max_rows
                 current_filename = f"{base}_{iteration}{ext}"
 
-            with open(current_filename, 'w', newline='', encoding='utf-8') as csvfile:
+            with open(current_filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 writer.writerows(chunk)
