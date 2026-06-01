@@ -29,16 +29,18 @@ This ETL pipeline follows a three-phase process:
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.12 or 3.13 (avoid 3.14 for now — Homebrew's 3.14 has known install issues)
 - Virtual environment (recommended)
 
 ## Installation
 
-1. Create and activate a virtual environment:
+1. Create and activate a virtual environment (use Python 3.12 or 3.13):
 ```bash
-python3 -m venv venv
+python3.12 -m venv venv
 source venv/bin/activate  # On macOS/Linux
 ```
+
+If you already have a broken `venv/` (e.g. after upgrading Homebrew Python), delete it first: `rm -rf venv`
 
 2. Install dependencies:
 ```bash
