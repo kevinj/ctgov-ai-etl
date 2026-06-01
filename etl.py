@@ -21,21 +21,9 @@ import urllib.parse
 import re
 import atexit
 from functools import lru_cache
-
-try:
-    import yaml
-    YAML_AVAILABLE = True
-except ImportError:
-    YAML_AVAILABLE = False
-
-try:
-    from google import genai
-    from google.genai import types
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    print("⚠️  Warning: google-generativeai not available. AI features will be disabled.")
-
+import yaml
+from google import genai
+from google.genai import types
 
 # ============================================================================
 # CONFIGURATION LOADING
@@ -59,9 +47,6 @@ def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
     try:
         with open(config_path, 'r') as f:
             if config_path.endswith(('.yaml', '.yml')):
-                if not YAML_AVAILABLE:
-                    print("❌ YAML support not available. Install with: pip install pyyaml")
-                    sys.exit(1)
                 config = yaml.safe_load(f)
             else:
                 config = json.load(f)
@@ -319,7 +304,7 @@ def _ensure_hc_disk_cache() -> Dict[str, Any]:
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                loaded = yaml.safe_load(f) if YAML_AVAILABLE else None
+                loaded = yaml.safe_load(f)
             _hc_disk_cache = loaded if isinstance(loaded, dict) else {}
             print(f"✅ Loaded Health Canada cache from {path}")
         except Exception as e:
@@ -337,9 +322,6 @@ def save_hc_disk_cache() -> None:
     """Persist in-memory Health Canada cache to disk if it has changed."""
     global _hc_disk_cache_dirty
     if not _hc_disk_cache_dirty or _hc_disk_cache is None:
-        return
-    if not YAML_AVAILABLE:
-        print("⚠️ Warning: Cannot save Health Canada cache without pyyaml")
         return
 
     path = _hc_cache_file()
@@ -576,7 +558,7 @@ def _ensure_fda_disk_cache() -> Dict[str, Any]:
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                loaded = yaml.safe_load(f) if YAML_AVAILABLE else None
+                loaded = yaml.safe_load(f)
             _fda_disk_cache = loaded if isinstance(loaded, dict) else {}
             print(f"✅ Loaded FDA drug cache from {path}")
         except Exception as e:
@@ -593,9 +575,6 @@ def save_fda_disk_cache() -> None:
     """Persist in-memory FDA drug cache to disk if it has changed."""
     global _fda_disk_cache_dirty
     if not _fda_disk_cache_dirty or _fda_disk_cache is None:
-        return
-    if not YAML_AVAILABLE:
-        print("⚠️ Warning: Cannot save FDA drug cache without pyyaml")
         return
 
     path = _fda_cache_file()
@@ -1080,10 +1059,6 @@ def initialize_gemini_models() -> Dict[str, Dict[str, Any]]:
     """
     global _ACTUAL_GEMINI_MODEL
     
-    if not GEMINI_AVAILABLE:
-        print("❌ Gemini library not available")
-        return {}
-    
     ai_config = CONFIG.get('ai_processing', {})
     api_key_env = ai_config.get('api_key_env', 'GEMINI_API_KEY')
     gemini_api_key = os.getenv(api_key_env, '')
@@ -1146,9 +1121,6 @@ def get_gemini_response(model_ctx: Dict[str, Any], row_prompt: str) -> Optional[
     Returns:
         Optional[str]: AI response or None if failed
     """
-    if not GEMINI_AVAILABLE:
-        return None
-    
     try:
         # Generate content using the new SDK
         client = model_ctx['client']
