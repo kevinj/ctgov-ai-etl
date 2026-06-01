@@ -21,6 +21,12 @@ ENV/
 # Config files (may contain sensitive info)
 config.yaml
 
+# Health Canada API response cache (generated at runtime)
+health_canada_cache.yaml
+
+# FDA/DailyMed API response cache (generated at runtime)
+fda_drug_cache.yaml
+
 # IDE
 .vscode/
 .idea/

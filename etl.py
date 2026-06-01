@@ -19,6 +19,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 import urllib.parse
 import re
+import atexit
 from functools import lru_cache
 
 try:
@@ -299,8 +300,105 @@ def _hc_api_urls():
     )
 
 
+_HC_CACHE_MISS = object()
+_hc_disk_cache: Optional[Dict[str, Any]] = None
+_hc_disk_cache_dirty = False
+
+
+def _hc_cache_file() -> str:
+    hc_config = CONFIG.get('health_canada_api', {})
+    return hc_config.get('cache_file', 'health_canada_cache.yaml')
+
+
+def _ensure_hc_disk_cache() -> Dict[str, Any]:
+    global _hc_disk_cache
+    if _hc_disk_cache is not None:
+        return _hc_disk_cache
+
+    path = _hc_cache_file()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = yaml.safe_load(f) if YAML_AVAILABLE else None
+            _hc_disk_cache = loaded if isinstance(loaded, dict) else {}
+            print(f"✅ Loaded Health Canada cache from {path}")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not load Health Canada cache ({path}): {e}")
+            _hc_disk_cache = {}
+    else:
+        _hc_disk_cache = {}
+
+    _hc_disk_cache.setdefault('active_ingredients', {})
+    _hc_disk_cache.setdefault('status', {})
+    return _hc_disk_cache
+
+
+def save_hc_disk_cache() -> None:
+    """Persist in-memory Health Canada cache to disk if it has changed."""
+    global _hc_disk_cache_dirty
+    if not _hc_disk_cache_dirty or _hc_disk_cache is None:
+        return
+    if not YAML_AVAILABLE:
+        print("⚠️ Warning: Cannot save Health Canada cache without pyyaml")
+        return
+
+    path = _hc_cache_file()
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(
+                _hc_disk_cache,
+                f,
+                default_flow_style=False,
+                sort_keys=True,
+                allow_unicode=True,
+            )
+        _hc_disk_cache_dirty = False
+        print(f"💾 Saved Health Canada cache to {path}")
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to save Health Canada cache ({path}): {e}")
+
+
+atexit.register(save_hc_disk_cache)
+
+
+def _hc_cache_get_active_ingredient(ingredient_name: str):
+    cache = _ensure_hc_disk_cache()
+    key = ingredient_name.lower()
+    ingredients = cache['active_ingredients']
+    if key not in ingredients:
+        return _HC_CACHE_MISS
+    return ingredients[key]
+
+
+def _hc_cache_set_active_ingredient(ingredient_name: str, data: List[dict]) -> None:
+    global _hc_disk_cache_dirty
+    cache = _ensure_hc_disk_cache()
+    cache['active_ingredients'][ingredient_name.lower()] = data
+    _hc_disk_cache_dirty = True
+
+
+def _hc_cache_get_status(drug_code: int):
+    cache = _ensure_hc_disk_cache()
+    key = str(drug_code)
+    statuses = cache['status']
+    if key not in statuses:
+        return _HC_CACHE_MISS
+    return statuses[key]
+
+
+def _hc_cache_set_status(drug_code: int, data: List[dict]) -> None:
+    global _hc_disk_cache_dirty
+    cache = _ensure_hc_disk_cache()
+    cache['status'][str(drug_code)] = data
+    _hc_disk_cache_dirty = True
+
+
 @lru_cache(maxsize=512)
 def fetch_hc_active_ingredients(ingredient_name: str):
+    cached = _hc_cache_get_active_ingredient(ingredient_name)
+    if cached is not _HC_CACHE_MISS:
+        return cached
+
     active_url, _ = _hc_api_urls()
     try:
         r = requests.get(
@@ -310,7 +408,11 @@ def fetch_hc_active_ingredients(ingredient_name: str):
         )
         if r.status_code != 200:
             return None
-        return r.json()
+        result = r.json()
+        if not isinstance(result, list):
+            result = []
+        _hc_cache_set_active_ingredient(ingredient_name, result)
+        return result
     except Exception as e:
         print(f"⚠️ Warning: Health Canada active ingredient fetch failed for {ingredient_name}: {e}")
         return None
@@ -318,6 +420,10 @@ def fetch_hc_active_ingredients(ingredient_name: str):
 
 @lru_cache(maxsize=512)
 def fetch_hc_status(drug_code: int):
+    cached = _hc_cache_get_status(drug_code)
+    if cached is not _HC_CACHE_MISS:
+        return cached
+
     _, status_url = _hc_api_urls()
     try:
         r = requests.get(
@@ -329,10 +435,13 @@ def fetch_hc_status(drug_code: int):
             return None
         data = r.json()
         if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return [data]
-        return None
+            result = data
+        elif isinstance(data, dict):
+            result = [data]
+        else:
+            result = []
+        _hc_cache_set_status(drug_code, result)
+        return result
     except Exception as e:
         print(f"⚠️ Warning: Health Canada status fetch failed for drug_code {drug_code}: {e}")
         return None
@@ -448,8 +557,103 @@ import xml.etree.ElementTree as ET
 # FDA / DAILYMED API (For better vaccine coverage)
 # ============================================================================
 
+_FDA_CACHE_MISS = object()
+_fda_disk_cache: Optional[Dict[str, Any]] = None
+_fda_disk_cache_dirty = False
+
+
+def _fda_cache_file() -> str:
+    dm_config = CONFIG.get('dailymed_api', {})
+    return dm_config.get('cache_file', 'fda_drug_cache.yaml')
+
+
+def _ensure_fda_disk_cache() -> Dict[str, Any]:
+    global _fda_disk_cache
+    if _fda_disk_cache is not None:
+        return _fda_disk_cache
+
+    path = _fda_cache_file()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = yaml.safe_load(f) if YAML_AVAILABLE else None
+            _fda_disk_cache = loaded if isinstance(loaded, dict) else {}
+            print(f"✅ Loaded FDA drug cache from {path}")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not load FDA drug cache ({path}): {e}")
+            _fda_disk_cache = {}
+    else:
+        _fda_disk_cache = {}
+
+    _fda_disk_cache.setdefault('labels', {})
+    return _fda_disk_cache
+
+
+def save_fda_disk_cache() -> None:
+    """Persist in-memory FDA drug cache to disk if it has changed."""
+    global _fda_disk_cache_dirty
+    if not _fda_disk_cache_dirty or _fda_disk_cache is None:
+        return
+    if not YAML_AVAILABLE:
+        print("⚠️ Warning: Cannot save FDA drug cache without pyyaml")
+        return
+
+    path = _fda_cache_file()
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(
+                _fda_disk_cache,
+                f,
+                default_flow_style=False,
+                sort_keys=True,
+                allow_unicode=True,
+            )
+        _fda_disk_cache_dirty = False
+        print(f"💾 Saved FDA drug cache to {path}")
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to save FDA drug cache ({path}): {e}")
+
+
+atexit.register(save_fda_disk_cache)
+
+
+def _fda_cache_get_label(drug_name: str):
+    cache = _ensure_fda_disk_cache()
+    key = drug_name.lower()
+    labels = cache['labels']
+    if key not in labels:
+        return _FDA_CACHE_MISS
+    return labels[key]
+
+
+def _fda_cache_set_label(drug_name: str, data: Optional[Dict[str, Any]]) -> None:
+    global _fda_disk_cache_dirty
+    cache = _ensure_fda_disk_cache()
+    key = drug_name.lower()
+    if data is None:
+        cache['labels'][key] = None
+    else:
+        stored = dict(data)
+        nct_ids = stored.get('nct_ids') or []
+        stored['nct_ids'] = sorted(nct_ids) if isinstance(nct_ids, set) else list(nct_ids)
+        cache['labels'][key] = stored
+    _fda_disk_cache_dirty = True
+
+
+def _fda_label_from_cache(cached: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if cached is None:
+        return None
+    result = dict(cached)
+    result['nct_ids'] = set(result.get('nct_ids') or [])
+    return result
+
+
 @lru_cache(maxsize=1024)
 def fetch_fda_label(drug_name):
+    cached = _fda_cache_get_label(drug_name)
+    if cached is not _FDA_CACHE_MISS:
+        return _fda_label_from_cache(cached)
+
     dm_config = CONFIG.get('dailymed_api', {})
     base_url = dm_config.get('spl_url', "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json")
     
@@ -478,7 +682,9 @@ def fetch_fda_label(drug_name):
         if data:
             break
             
-    if not data: return None
+    if not data:
+        _fda_cache_set_label(drug_name, None)
+        return None
     # Use the first match
     setid = data['data'][0]['setid']
     pub_date = data['data'][0].get('published_date', '')
@@ -543,7 +749,7 @@ def fetch_fda_label(drug_name):
                 
             nct_ids = set([n.upper() for n in re.findall(r'NCT\d{8}', xml_data, re.IGNORECASE)])
                 
-            return {
+            result = {
                 'application_number': app_num,
                 'pregnancy': preg,
                 'lactation': lact,
@@ -551,7 +757,9 @@ def fetch_fda_label(drug_name):
                 'lact_status': lact_status,
                 'nct_ids': nct_ids
             }
-    except Exception as e:
+            _fda_cache_set_label(drug_name, result)
+            return result
+    except Exception:
         pass
     return None
 

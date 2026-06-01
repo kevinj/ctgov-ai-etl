@@ -1,3 +1,9 @@
+health_canada_api:
+  cache_file: health_canada_cache.yaml
+
+dailymed_api:
+  cache_file: fda_drug_cache.yaml
+
 ctgov:
   api_url: https://clinicaltrials.gov/api/v2/studies
   page_size: 1000
