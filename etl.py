@@ -24,6 +24,8 @@ from functools import lru_cache
 import yaml
 from google import genai
 from google.genai import types
+import vertexai
+from vertexai.generative_models import GenerativeModel
 
 # ============================================================================
 # CONFIGURATION LOADING
@@ -300,6 +302,13 @@ def _ensure_hc_disk_cache() -> Dict[str, Any]:
     if _hc_disk_cache is not None:
         return _hc_disk_cache
 
+    hc_config = CONFIG.get('health_canada_api', {})
+    disable_cache = hc_config.get('disable_cache', False)
+
+    if disable_cache:
+        _hc_disk_cache = {'active_ingredients': {}, 'status': {}}
+        return _hc_disk_cache
+
     path = _hc_cache_file()
     if os.path.exists(path):
         try:
@@ -321,7 +330,10 @@ def _ensure_hc_disk_cache() -> Dict[str, Any]:
 def save_hc_disk_cache() -> None:
     """Persist in-memory Health Canada cache to disk if it has changed."""
     global _hc_disk_cache_dirty
-    if not _hc_disk_cache_dirty or _hc_disk_cache is None:
+    hc_config = CONFIG.get('health_canada_api', {})
+    disable_cache = hc_config.get('disable_cache', False)
+    
+    if disable_cache or not _hc_disk_cache_dirty or _hc_disk_cache is None:
         return
 
     path = _hc_cache_file()
@@ -787,6 +799,20 @@ def fetch_fda_info(interventions: List[str], current_nct_id: str):
 # TRANSFORM - Functions that transform and process data
 # ============================================================================
 
+def parse_age_in_years(age_str: str) -> Optional[float]:
+    if not age_str or age_str == 'N/A':
+        return None
+    age_str = age_str.lower()
+    match = re.match(r'([\d.]+)\s*(year|month|week|day)', age_str)
+    if match:
+        val = float(match.group(1))
+        unit = match.group(2)
+        if unit == 'year': return val
+        elif unit == 'month': return val / 12.0
+        elif unit == 'week': return val / 52.0
+        elif unit == 'day': return val / 365.0
+    return None
+
 def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     """
     Transform raw study data into structured format for CSV output.
@@ -815,7 +841,16 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     overall_status = status.get('overallStatus', 'N/A')
     start_date_struct = status.get('startDateStruct', {})
     start_date = start_date_struct.get('date', 'N/A')
-    start_year = start_date.split('-')[0] if start_date != 'N/A' and '-' in start_date else 'N/A'
+    start_year = "N/A"
+    if start_date != 'N/A':
+        match = re.search(r'\b(\d{4})\b', start_date)
+        if match:
+            start_year = match.group(1)
+            
+    primary_completion_date = status.get('primaryCompletionDateStruct', {}).get('date', 'N/A')
+    completion_date = status.get('completionDateStruct', {}).get('date', 'N/A')
+    first_posted_date = status.get('studyFirstPostDateStruct', {}).get('date', 'N/A')
+    last_update_date = status.get('lastUpdatePostDateStruct', {}).get('date', 'N/A')
     
     # Sponsors and Funders
     sponsor_module = protocol_section.get('sponsorCollaboratorsModule', {})
@@ -854,6 +889,18 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     healthy_volunteers = eligibility.get('healthyVolunteers', 'N/A')
     criteria_text = eligibility.get('eligibilityCriteria', 'N/A')
     
+    applicable = "TRUE"
+    if gender.upper() == "MALE":
+        applicable = "FALSE"
+    
+    parsed_min = parse_age_in_years(min_age)
+    parsed_max = parse_age_in_years(max_age)
+    
+    if parsed_max is not None and parsed_max < 18:
+        applicable = "FALSE"
+    if parsed_min is not None and parsed_min > 55:
+        applicable = "FALSE"
+    
     # Description
     description = protocol_section.get('descriptionModule', {})
     brief_summary = description.get('briefSummary', 'N/A')
@@ -875,6 +922,9 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     
     sites_detail_str = '\n'.join(sites_list) if sites_list else 'N/A'
     
+    # New Columns
+    site_count_type = "Multi-site" if len(locations) > 1 else ("Single-site" if len(locations) == 1 else "Unknown/None")
+    has_canadian_site = "TRUE" if "Canada" in unique_countries else "FALSE"
     # Arms and Interventions
     arms_interventions = protocol_section.get('armsInterventionsModule', {})
     
@@ -1006,9 +1056,14 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
         'overall_status': overall_status,
         'study_type': study_type,
         'start_date': start_date,
+        'primary_completion_date': primary_completion_date,
+        'completion_date': completion_date,
+        'first_posted_date': first_posted_date,
+        'last_update_date': last_update_date,
         'gender': gender,
         'minimum_age': min_age,
         'maximum_age': max_age,
+        'Applicable': applicable,
         'healthy_volunteers': healthy_volunteers,
         'brief_summary': brief_summary,
         'detailed_description': detailed_description,
@@ -1017,6 +1072,8 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
         'location': location_str,
         'countries_str': location_str,
         'sites_detail': sites_detail_str,
+        'site_count_type': site_count_type,
+        'has_canadian_site': has_canadian_site,
         'phase': phase_str,
         'enrollment': enrollment,
         'results_link': results_link,
@@ -1069,7 +1126,8 @@ def initialize_gemini_models() -> Dict[str, Dict[str, Any]]:
         return {}
     
     try:
-        client = genai.Client(api_key=gemini_api_key)
+        vertexai.init(project="project-0b52e79a-4960-471d-9d8", location="us-central1")
+        
         model_name = ai_config.get('model', 'gemini-2.5-flash')
         _ACTUAL_GEMINI_MODEL = model_name
         
@@ -1092,12 +1150,13 @@ def initialize_gemini_models() -> Dict[str, Dict[str, Any]]:
                 
             system_instruction = col.get('system_instruction', '')
             
+            col_model = GenerativeModel(
+                model_name=model_name,
+                system_instruction=[system_instruction] if system_instruction else None
+            )
+            
             models[col_name] = {
-                'client': client,
-                'model_name': model_name,
-                'config': types.GenerateContentConfig(
-                    system_instruction=system_instruction
-                )
+                'model': col_model
             }
             print(f"✅ Initialized model for column '{col_name}'")
         
@@ -1115,7 +1174,7 @@ def get_gemini_response(model_ctx: Dict[str, Any], row_prompt: str) -> Optional[
     Get response from Gemini API for a single row.
     
     Args:
-        model_ctx (Dict): Dictionary with client, model_name, and config
+        model_ctx (Dict): Dictionary with model
         row_prompt (str): Row-specific prompt (context already set via system instruction)
         
     Returns:
@@ -1123,12 +1182,8 @@ def get_gemini_response(model_ctx: Dict[str, Any], row_prompt: str) -> Optional[
     """
     try:
         # Generate content using the new SDK
-        client = model_ctx['client']
-        response = client.models.generate_content(
-            model=model_ctx['model_name'],
-            contents=row_prompt,
-            config=model_ctx['config']
-        )
+        model = model_ctx['model']
+        response = model.generate_content(row_prompt)
 
         # Extract text from response
         if response and response.text:
@@ -1195,67 +1250,91 @@ def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, A
         print("❌ No columns to process. AI processing is required.")
         sys.exit(1)
         
+    output_config = CONFIG.get('output', {})
+    filename = output_config.get('csv_filename', 'clinical_trials_filtered.csv')
+    
+    existing_ai_data = {}
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    nct_id = row.get('nct_id')
+                    if nct_id:
+                        # Store all AI columns
+                        ai_vals = {col.get('name'): row.get(col.get('name')) for col in columns if row.get(col.get('name')) and row.get(col.get('name')) != 'N/A'}
+                        if ai_vals:
+                            existing_ai_data[nct_id] = ai_vals
+            print(f"📖 Loaded existing AI data for {len(existing_ai_data)} trials from {filename}")
+        except Exception as e:
+            print(f"⚠️ Could not load existing CSV to resume: {e}")
+
     # Determine which studies to process
-    max_ai_rows = ai_config.get('max_rows')
-    if max_ai_rows is None:
-        studies_to_process = studies
-        remaining_studies = []
-        limit_msg = "all"
-    else:
-        studies_to_process = studies[:max_ai_rows]
-        remaining_studies = studies[max_ai_rows:]
-        limit_msg = f"first {max_ai_rows}"
+    max_new_calls = ai_config.get('max_rows', 250)
     
-    # Filter to only tuning trials if debug mode is enabled
-    if ai_config.get('debug_only_tuning_trials', False):
-        tuning_trials = CONFIG.get('tuning_trials', [])
-        tuning_trials_set = set(tuning_trials)
-        original_count = len(studies_to_process)
-        filtered_tuning = [s for s in studies_to_process if s.get('nct_id') in tuning_trials_set]
-        filtered_out = [s for s in studies_to_process if s.get('nct_id') not in tuning_trials_set]
-        studies_to_process = filtered_tuning
-        remaining_studies.extend(filtered_out)
-        if original_count != len(studies_to_process):
-            print(f"🔍 Debug mode: Filtered to {len(studies_to_process)} tuning trials (from {original_count} studies)")
-    
-    ai_config = CONFIG.get('ai_processing', {})
     model_name = ai_config.get('model', 'gemini-2.5-flash')
     
-    total_studies = len(studies_to_process)
-    print(f"\n🤖 Transforming {len(studies_to_process)} studies with Gemini AI ({limit_msg} studies)...")
+    print(f"\n🤖 Transforming studies with Gemini AI (Max {max_new_calls} new AI evaluations)...")
     print(f"   Model: {model_name}")
     print("-" * 60)
     
     processed_studies = []
+    remaining_studies = []
+    new_processed_count = 0
+    quota_exceeded = False
 
-    for i, study in enumerate(studies_to_process):
-        nct_id = study.get('nct_id', 'Unknown')
-        print(f"  [{i+1}/{total_studies}] Processing {nct_id}...", end=' ', flush=True)
-        
-        all_success = True
-        for col in columns:
-            col_name = col.get('name')
-            if (not col_name):
-                print(f"❌ Column name is required. Column: {col}")
-                sys.exit(1)
-
-            model = models[col_name]
-            ai_value = process_study_with_ai(model, study)
-            study[col_name] = ai_value
-        
-        print("✓")
-        
-        processed_studies.append(study)
+    try:
+        for i, study in enumerate(studies):
+            nct_id = study.get('nct_id', 'Unknown')
+            
+            # Check if we already have it
+            if nct_id in existing_ai_data:
+                for col_name, val in existing_ai_data[nct_id].items():
+                    study[col_name] = val
+                processed_studies.append(study)
+                continue
+                
+            if new_processed_count >= max_new_calls or quota_exceeded:
+                remaining_studies.append(study)
+                continue
+                
+            print(f"  [{new_processed_count+1}/{max_new_calls} new] Processing {nct_id}...", end=' ', flush=True)
+            
+            for col in columns:
+                col_name = col.get('name')
+                model = models[col_name]
+                ai_value = process_study_with_ai(model, study)
+                
+                if ai_value is None:
+                    # Assumes None means API error/timeout/quota
+                    print("⚠️ Quota Exceeded or API Error! Stopping AI processing.")
+                    quota_exceeded = True
+                    study[col_name] = "N/A"
+                else:
+                    study[col_name] = ai_value
+            
+            if not quota_exceeded:
+                print("✓")
+            
+            processed_studies.append(study)
+            new_processed_count += 1
+            
+    except KeyboardInterrupt:
+        print(f"\n⚠️ User interrupted! Saving {len(processed_studies)} processed studies so far...")
+        # Move remaining to remaining_studies
+        remaining_studies.extend(studies[len(processed_studies) + len(remaining_studies):])
     
     # Add remaining studies without AI transformation
     for study in remaining_studies:
         for col in columns:
             col_name = col.get('name')
-            study[col_name] = 'N/A'
+            if col_name not in study:
+                study[col_name] = 'N/A'
         processed_studies.append(study)
     
     print(f"\n✅ AI transformation complete:")
-    print(f"   Processed with AI: {len(studies_to_process)} studies")
+    print(f"   Resumed from CSV: {len(processed_studies) - len(remaining_studies) - new_processed_count} studies")
+    print(f"   New Processed with AI: {new_processed_count} studies")
     if remaining_studies:
         print(f"   Remaining {len(remaining_studies)} studies set to 'N/A'")
     
@@ -1287,9 +1366,10 @@ def load_to_csv(studies: List[Dict[str, Any]], filename: Optional[str] = None) -
     # Base fieldnames
     fieldnames = [
         'nct_id', 'brief_title', 'official_title', 'conditions', 'overall_status',
-        'minimum_age', 'maximum_age', 'study_type', 'start_date',
+        'minimum_age', 'maximum_age', 'Applicable', 'study_type', 'start_date',
+        'primary_completion_date', 'completion_date', 'first_posted_date', 'last_update_date',
         'gender', 'healthy_volunteers', 'brief_summary', 'detailed_description', 'criteria',
-        'start_year', 'location', 'phase', 'enrollment', 'results_link',
+        'start_year', 'location', 'sites_detail', 'site_count_type', 'has_canadian_site', 'phase', 'enrollment', 'results_link',
         'publications', 'pubmed_publications',
         'intervention_types', 'intervention_names', 'intervention_descriptions',
         'primary_outcomes', 'secondary_outcomes',
@@ -1354,37 +1434,58 @@ def main():
     print("ClinicalTrials.gov ETL - Data Fetcher with Gemini AI")
     print("="*60)
     
-    # EXTRACT: Fetch all studies from API
-    study_data = extract_clinical_trials()
-    
-    if not study_data:
-        print("❌ Failed to extract data from API")
-        sys.exit(1)
-    
-    # TRANSFORM: Transform raw studies to structured format
-    raw_studies = study_data.get('studies', [])
-    print(f"\n📊 Found {len(raw_studies)} total studies")
-
-    # Limit processing if max_rows is set
-    ai_config = CONFIG.get('ai_processing', {})
-    if ai_config.get('debug_only_tuning_trials', False):
-        tuning_trials = set(CONFIG.get('tuning_trials', []))
-        raw_studies = [s for s in raw_studies if s.get('protocolSection', {}).get('identificationModule', {}).get('nctId') in tuning_trials]
-        print(f"🔍 Debug mode: Filtered to {len(raw_studies)} tuning trials")
-    elif ai_config.get('max_rows') is not None:
-        raw_studies = raw_studies[:ai_config.get('max_rows')]
-        print(f"📊 Limited to first {ai_config.get('max_rows')} studies for testing")
+    resume_from_csv = CONFIG.get('ctgov', {}).get('resume_from_csv', False)
+    output_config = CONFIG.get('output', {})
+    filename = output_config.get('csv_filename', 'clinical_trials_filtered.csv')
     
     transformed_studies = []
-    for i, study in enumerate(raw_studies):
-        if i % 10 == 0:
-            print(f"Transforming study {i+1}/{len(raw_studies)}...")
-        transformed_studies.append(transform_study_data(study))
-
     
-    if not transformed_studies:
-        print("❌ No studies after transformation")
-        sys.exit(1)
+    if resume_from_csv and os.path.exists(filename):
+        print(f"\n📂 Resuming entirely from existing CSV: {filename}")
+        try:
+            with open(filename, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                transformed_studies = [row for row in reader]
+            print(f"📊 Loaded {len(transformed_studies)} studies directly from CSV")
+        except Exception as e:
+            print(f"❌ Failed to load CSV: {e}")
+            sys.exit(1)
+            
+        # Apply row limits if needed
+        ai_config = CONFIG.get('ai_processing', {})
+        if ai_config.get('max_rows') is not None:
+            transformed_studies = transformed_studies[:ai_config.get('max_rows')]
+            
+    else:
+        # EXTRACT: Fetch all studies from API
+        study_data = extract_clinical_trials()
+        
+        if not study_data:
+            print("❌ Failed to extract data from API")
+            sys.exit(1)
+        
+        # TRANSFORM: Transform raw studies to structured format
+        raw_studies = study_data.get('studies', [])
+        print(f"\n📊 Found {len(raw_studies)} total studies")
+
+        # Limit processing if max_rows is set
+        ai_config = CONFIG.get('ai_processing', {})
+        if ai_config.get('debug_only_tuning_trials', False):
+            tuning_trials = set(CONFIG.get('tuning_trials', []))
+            raw_studies = [s for s in raw_studies if s.get('protocolSection', {}).get('identificationModule', {}).get('nctId') in tuning_trials]
+            print(f"🔍 Debug mode: Filtered to {len(raw_studies)} tuning trials")
+        elif ai_config.get('max_rows') is not None:
+            raw_studies = raw_studies[:ai_config.get('max_rows')]
+            print(f"📊 Limited to first {ai_config.get('max_rows')} studies for testing")
+        
+        for i, study in enumerate(raw_studies):
+            if i % 10 == 0:
+                print(f"Transforming study {i+1}/{len(raw_studies)}...")
+            transformed_studies.append(transform_study_data(study))
+
+        if not transformed_studies:
+            print("❌ No studies after transformation")
+            sys.exit(1)
     
     # TRANSFORM: Apply AI transformation
     transformed_studies = transform_studies_with_ai(transformed_studies)
