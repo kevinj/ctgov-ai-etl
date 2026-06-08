@@ -24,6 +24,8 @@ from functools import lru_cache
 import yaml
 from google import genai
 from google.genai import types
+import vertexai
+from vertexai.generative_models import GenerativeModel
 
 # ============================================================================
 # CONFIGURATION LOADING
@@ -1114,7 +1116,8 @@ def initialize_gemini_models() -> Dict[str, Dict[str, Any]]:
         return {}
     
     try:
-        client = genai.Client(api_key=gemini_api_key)
+        vertexai.init(project="project-0b52e79a-4960-471d-9d8", location="us-central1")
+        
         model_name = ai_config.get('model', 'gemini-2.5-flash')
         _ACTUAL_GEMINI_MODEL = model_name
         
@@ -1137,12 +1140,13 @@ def initialize_gemini_models() -> Dict[str, Dict[str, Any]]:
                 
             system_instruction = col.get('system_instruction', '')
             
+            col_model = GenerativeModel(
+                model_name=model_name,
+                system_instruction=[system_instruction] if system_instruction else None
+            )
+            
             models[col_name] = {
-                'client': client,
-                'model_name': model_name,
-                'config': types.GenerateContentConfig(
-                    system_instruction=system_instruction
-                )
+                'model': col_model
             }
             print(f"✅ Initialized model for column '{col_name}'")
         
@@ -1160,7 +1164,7 @@ def get_gemini_response(model_ctx: Dict[str, Any], row_prompt: str) -> Optional[
     Get response from Gemini API for a single row.
     
     Args:
-        model_ctx (Dict): Dictionary with client, model_name, and config
+        model_ctx (Dict): Dictionary with model
         row_prompt (str): Row-specific prompt (context already set via system instruction)
         
     Returns:
@@ -1168,12 +1172,8 @@ def get_gemini_response(model_ctx: Dict[str, Any], row_prompt: str) -> Optional[
     """
     try:
         # Generate content using the new SDK
-        client = model_ctx['client']
-        response = client.models.generate_content(
-            model=model_ctx['model_name'],
-            contents=row_prompt,
-            config=model_ctx['config']
-        )
+        model = model_ctx['model']
+        response = model.generate_content(row_prompt)
 
         # Extract text from response
         if response and response.text:
@@ -1246,7 +1246,7 @@ def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, A
     existing_ai_data = {}
     if os.path.exists(filename):
         try:
-            with open(filename, 'r', encoding='utf-8') as f:
+            with open(filename, 'r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     nct_id = row.get('nct_id')
@@ -1433,7 +1433,7 @@ def main():
     if resume_from_csv and os.path.exists(filename):
         print(f"\n📂 Resuming entirely from existing CSV: {filename}")
         try:
-            with open(filename, 'r', encoding='utf-8') as f:
+            with open(filename, 'r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 transformed_studies = [row for row in reader]
             print(f"📊 Loaded {len(transformed_studies)} studies directly from CSV")
