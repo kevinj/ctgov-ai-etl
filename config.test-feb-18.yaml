@@ -16,7 +16,8 @@ output:
   max_rows_per_file: 10000
 
 health_canada_api:
-  enabled: FALSE
+  enabled: TRUE
+  disable_cache: TRUE
   product_url: https://health-products.canada.ca/api/drug/drugproduct/?lang=en&type=json
   status_url: https://health-products.canada.ca/api/drug/status/?lang=en&type=json
 
@@ -179,7 +180,7 @@ ai_processing:
         
 
 output:
-  csv_filename: clinical_trials_processed-test.may-24.csv
+  csv_filename: clinical_trials_processed-test.june-7.csv
   max_rows_per_file: 3000
 
 tuning_trials:

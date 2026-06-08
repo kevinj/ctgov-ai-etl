@@ -302,6 +302,13 @@ def _ensure_hc_disk_cache() -> Dict[str, Any]:
     if _hc_disk_cache is not None:
         return _hc_disk_cache
 
+    hc_config = CONFIG.get('health_canada_api', {})
+    disable_cache = hc_config.get('disable_cache', False)
+
+    if disable_cache:
+        _hc_disk_cache = {'active_ingredients': {}, 'status': {}}
+        return _hc_disk_cache
+
     path = _hc_cache_file()
     if os.path.exists(path):
         try:
@@ -323,7 +330,10 @@ def _ensure_hc_disk_cache() -> Dict[str, Any]:
 def save_hc_disk_cache() -> None:
     """Persist in-memory Health Canada cache to disk if it has changed."""
     global _hc_disk_cache_dirty
-    if not _hc_disk_cache_dirty or _hc_disk_cache is None:
+    hc_config = CONFIG.get('health_canada_api', {})
+    disable_cache = hc_config.get('disable_cache', False)
+    
+    if disable_cache or not _hc_disk_cache_dirty or _hc_disk_cache is None:
         return
 
     path = _hc_cache_file()
