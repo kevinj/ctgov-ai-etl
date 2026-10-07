@@ -1,0 +1,175 @@
+ctgov:
+  api_url: https://clinicaltrials.gov/api/v2/studies
+  page_size: 2000
+  filter_advanced:
+    - AREA[StudyType]INTERVENTIONAL
+    - AREA[StartDate]RANGE[2015-01-01,2025-01-15]
+    - (AREA[Sex]ALL)
+    - (AREA[MaximumAge]RANGE[18 Years,MAX] OR AREA[MaximumAge]MISSING)
+    - (AREA[MinimumAge]RANGE[MIN,50 Years] OR AREA[MinimumAge]MISSING)
+    - (AREA[InterventionType]DRUG OR AREA[InterventionType]BIOLOGICAL)
+    - (AREA[ConditionSearch]vaccin* OR AREA[InterventionSearch]vaccin* OR AREA[OfficialTitle]vaccin* OR AREA[BriefTitle]vaccin* OR AREA[BriefSummary]vaccin*)
+    
+health_canada_api:
+  product_url: https://health-products.canada.ca/api/drug/drugproduct/?lang=en&type=json
+  status_url: https://health-products.canada.ca/api/drug/status/?lang=en&type=json
+
+fda_api:
+  label_url: https://api.fda.gov/drug/label.json
+
+ai_processing:
+  enabled: FALSE
+  api_key_env: GEMINI_API_KEY
+  model: gemini-2.5-flash
+  api_delay: 0.5
+  max_rows: null
+  debug_only_tuning_trials: FALSE
+  row_prompt_template: |
+    Analyze the following clinical trial study:
+
+    NCT ID: {nct_id}
+    Title: {brief_title}
+    Condition(s): {conditions}
+    Official Title: {official_title}
+    Funder Info: {funder_info}
+    Summary: {brief_summary}
+    Phase: {phase}
+    Enrollment: {enrollment}
+    Healthy Volunteers: {healthy_volunteers}
+    Allocation: {allocation}
+    Intervention Model: {intervention_model}
+    Primary Purpose: {primary_purpose}
+    Masking: {masking}
+    Results Link: {results_link}
+    Location: {location}
+    Detailed Description: {detailed_description}
+    Eligibility Criteria: {criteria}
+    
+    Outcome Measures (Primary):
+    {primary_outcomes}
+    
+    Outcome Measures (Secondary):
+    {secondary_outcomes}
+    
+    Arm Groups (Comparators):
+    {arm_groups}
+
+    Interventions:
+    {intervention_descriptions}
+
+    Trial Sites:
+    {sites_detail}
+
+    # External Publications (CT.gov):
+    # {publications}
+
+    # Published Literature (PubMed Search):
+    # {pubmed_publications}
+
+    # FDA Drug API (Approval Status):
+    # {FDA Approved Status}
+    
+    # FDA Drug API (Pregnancy & Lactation Safety):
+    # {FDA Pregnancy & Lactation Safety}
+
+    # Health Canada DPD API (Approval Status):
+    # {Health Canada Approval}
+    
+    # Health Canada DPD API (Pregnancy & Lactation Safety):
+    # {Health Canada Pregnancy & Lactation Safety}
+  
+  columns:
+    -
+      name: pregnancy_classification
+      system_instruction: |
+        You will be analyzing information about clinical trials, including the eligibility criteria.
+        Classify this trial into ONE of the following categories based on participant requirements:
+
+        ONLY_PREGNANCY: The trial specifically targets pregnant participants. Pregnancy is a REQUIRED inclusion criterion for enrollment.
+        INCLUDE_PREGNANCY: The trial is for a general population but explicitly allows pregnant individuals to enroll (e.g., "Pregnant women may be included if...").
+        EXCLUDE_PREGNANCY: The trial explicitly excludes pregnant individuals or requires participants to use contraception (e.g., requires negative tests, contraception, or states "Pregnancy is an exclusion criterion").
+        POSTPARTUM: The trial targets individuals who have already given birth and are in the postpartum period.
+        FERTILITY: The trial targets participants who are trying to conceive.
+        NOT_MENTIONED: There is no mention of pregnancy inclusion or exclusion in the criteria.
+
+        I am going to provide an example of what it often, but not always looks like, demarcated by '==='.
+        You will be provided with examples of criteria and their classifications, then you will classify new criteria.
+
+        Example 1: === Inclusion Criteria:... Women of childbearing potential need a negative pregnancy test; Exclusion Criteria: Pregnant at enrollment; women who are pregnant; currently pregnant; pregnant or; positive pregnancy test; positive serum pregnancy test; pregnancy; positive urine pregnancy test ... === EXCLUDE_PREGNANCY 'Pregnant';
+        Example 2: === Inclusion Criteria: pregnant at enrollment; pregnancy; positive pregnancy test; positive serum pregnancy test; active labor; negative pregnancy test; negative urine pregnancy test; serum pregnancy test must be negative ... Exclusion Criteria: ... === INCLUDE_PREGNANCY 'pregnant at enrollment';
+        Example 3: === Inclusion Criteria: (no mention of pregnancy) ... Exclusion Criteria: ... (no mention of pregnancy) === NOT_MENTIONED;
+        Example 4: === Inclusion Criteria: negative serum pregnancy test; pregnancy test is negative; serum pregnancy test must be negative ... Exclusion Criteria: Positive pregnancy test; trying to get pregnant... === EXCLUDE_PREGNANCY 'negative pregnancy test';
+        Example 5: === Inclusion Criteria: postpartum... Exclusion Criteria:... === POSTPARTUM 'postpartum';
+        Example 6: === Inclusion Criteria: trying to get pregnant... Exclusion Criteria:... === FERTILITY 'trying to get pregnant';
+
+        You are to output the outcome of the classification (Only the category name, not the full text of the category),
+        and then quote the part of the criteria that gave you confidence as to the result.
+
+    - 
+      name: lactation_classification
+      system_instruction: |
+        Classify this trial into ONE of the following categories based on participant requirements:
+
+        ONLY_LACTATION: The trial specifically targets lactating (breastfeeding/chestfeeding) participants. Lactation is a REQUIRED inclusion criterion for enrollment.
+        INCLUDE_LACTATION: The trial is for a general population but explicitly allows lactating individuals to enroll.
+        EXCLUDE_LACTATION: The trial explicitly excludes lactating individuals (e.g., states "Breastfeeding is an exclusion criterion" or "Nursing women are excluded").
+        POSTPARTUM_ONLY: The trial targets individuals in the postpartum period but either excludes lactation or does not mention it.
+        NOT_MENTIONED: There is no mention of lactation/breastfeeding inclusion or exclusion in the criteria.
+
+        Output only the category name, followed by a colon and the supporting quote from the criteria that justifies the classification.
+    - 
+      name: contraception_classification
+      system_instruction: |
+        You will be analyzing information about clinical trials, including the eligibility criteria. 
+        When the trial requires the participant to use contraception, output "REQUIRED".
+        When the trial does not require the participant use contraception, output "NOT_REQUIRED".
+        When the trial doe not mention contracption, output "NOT_MENTIONED". 
+        
+
+    - 
+      name: Intervention
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        Determine the name of the intervention used in this trial and if it is a biologic, drug, or vaccine. 
+        You are to output name of the intervention (only the name), 
+        and then the type of intervention in parenthesis (biologic, drug, or vaccine). 
+
+
+    - 
+      name: vaccine_platform
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        Determine the vaccine platform used in this trial. 
+        You are to output the vaccine platform (only the name),
+        and then if there are more details in parenthesis.
+   
+    - 
+      name: Trial_Sites
+      system_instruction: |
+        You will be analyzing information about clinical trials.
+        Determine the number of trial sites in each country.
+        Output the names of the countries where there are trial sites, 
+        and then for each country, output the number of sites in that country in parenthesis. 
+
+
+output:
+  csv_filename: clinical_trials_vaccines.csv
+  max_rows_per_file: 3000
+
+tuning_trials:
+  
+  - NCT02252640
+  - NCT04206813
+  - NCT03313050
+  - NCT05859490
+  - NCT05559983
+  - NCT02938442
+  - NCT03589794
+
+
+
+ 
+ 
+
+
+
