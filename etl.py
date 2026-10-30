@@ -7,14 +7,16 @@ and outputs a CSV with specified columns.
 Configuration is loaded from a JSON or YAML file (default: config.yaml).
 """
 
+from requests import api
 import requests
 import json
+import concurrent.futures
 import csv
 import sys
 import os
 import time
 import argparse
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 from urllib.parse import urlencode
 import urllib.parse
@@ -451,6 +453,9 @@ def _hc_approval_year(statuses: List[dict]) -> Optional[str]:
 
 def fetch_health_canada_approval(interventions: List[str]) -> str:
     """Check each intervention against Health Canada database."""
+    if not CONFIG.get('health_canada_api', {}).get('enabled', True):
+        return "N/A"
+        
     if not interventions:
         return "N/A"
 
@@ -759,21 +764,21 @@ def fetch_fda_info(interventions: List[str], current_nct_id: str):
         
         data = fetch_fda_label(clean_name)
         if data:
-            status_list.append(f"APPROVED - {clean_name} ({data['application_number']})")
+            status_list.append(f"APPROVED ({data['application_number']}) [{clean_name.upper()}]")
             preg_text = data['pregnancy'] or "No specific pregnancy section found."
             lact_text = data['lactation'] or "No specific lactation section found."
-            safety_list.append(f"[{clean_name.upper()}]\nPregnancy: {preg_text}\nLactation: {lact_text}")
-            preg_contra_list.append(f"[{clean_name.upper()}]: {data['preg_status']}")
-            lact_contra_list.append(f"[{clean_name.upper()}]: {data['lact_status']}")
+            safety_list.append(f"Pregnancy: {preg_text}\nLactation: {lact_text}\n[{clean_name.upper()}]")
+            preg_contra_list.append(f"{data['preg_status']} [{clean_name.upper()}]")
+            lact_contra_list.append(f"{data['lact_status']} [{clean_name.upper()}]")
             
             cited = "True" if current_nct_id.upper() in data.get('nct_ids', set()) else "False"
-            cited_list.append(f"[{clean_name.upper()}]: {cited}")
+            cited_list.append(f"{cited} [{clean_name.upper()}]")
         else:
-            status_list.append(f"NOT APPROVED - {clean_name} (Not found in DailyMed/FDA)")
-            safety_list.append(f"[{clean_name.upper()}]\nFDA Safety: N/A")
-            preg_contra_list.append(f"[{clean_name.upper()}]: N/A")
-            lact_contra_list.append(f"[{clean_name.upper()}]: N/A")
-            cited_list.append(f"[{clean_name.upper()}]: N/A")
+            status_list.append(f"NOT APPROVED (Not found in DailyMed/FDA) [{clean_name.upper()}]")
+            safety_list.append(f"FDA Safety: N/A\n[{clean_name.upper()}]")
+            preg_contra_list.append(f"N/A [{clean_name.upper()}]")
+            lact_contra_list.append(f"N/A [{clean_name.upper()}]")
+            cited_list.append(f"N/A [{clean_name.upper()}]")
             
     status_str = "\n".join(status_list) if status_list else "N/A"
     safety_str = "\n\n".join(safety_list) if safety_list else "N/A"
@@ -786,6 +791,800 @@ def fetch_fda_info(interventions: List[str], current_nct_id: str):
 # ============================================================================
 # TRANSFORM - Functions that transform and process data
 # ============================================================================
+
+def parse_age_in_years(age_str: str) -> Optional[float]:
+    if not age_str or age_str == 'N/A':
+        return None
+    age_str = age_str.lower()
+    match = re.match(r'([\d.]+)\s*(year|month|week|day)', age_str)
+    if match:
+        val = float(match.group(1))
+        unit = match.group(2)
+        if unit == 'year': return val
+        elif unit == 'month': return val / 12.0
+        elif unit == 'week': return val / 52.0
+        elif unit == 'day': return val / 365.0
+    return None
+
+
+
+_openfda_disk_cache = None
+_openfda_disk_cache_dirty = False
+
+def _openfda_cache_file() -> str:
+    config = CONFIG.get('openfda_api', {})
+    return config.get('cache_file', 'openfda_cache.yaml')
+
+def _use_openfda_cache() -> bool:
+    config = CONFIG.get('openfda_api', {})
+    return config.get('use_cache', True)
+
+import threading
+_openfda_cache_lock = threading.Lock()
+
+def _ensure_openfda_disk_cache() -> dict:
+    global _openfda_disk_cache
+    if _openfda_disk_cache is not None:
+        return _openfda_disk_cache
+
+    with _openfda_cache_lock:
+        if _openfda_disk_cache is not None:
+            return _openfda_disk_cache
+            
+        path = _openfda_cache_file()
+        if os.path.exists(path):
+            try:
+                import yaml
+                with open(path, 'r', encoding='utf-8') as f:
+                    loaded = yaml.safe_load(f)
+                _openfda_disk_cache = loaded if isinstance(loaded, dict) else {}
+                print(f"✅ Loaded OpenFDA cache from {path}")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not load OpenFDA cache ({path}): {e}")
+                _openfda_disk_cache = {}
+        else:
+            _openfda_disk_cache = {}
+
+    _openfda_disk_cache.setdefault('epc', {})
+    _openfda_disk_cache.setdefault('approval_date', {})
+    _openfda_disk_cache.setdefault('withdrawn', {})
+    return _openfda_disk_cache
+
+def save_openfda_disk_cache() -> None:
+    global _openfda_disk_cache_dirty
+    if not _openfda_disk_cache_dirty or _openfda_disk_cache is None:
+        return
+    path = _openfda_cache_file()
+    try:
+        import yaml
+        with open(path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(_openfda_disk_cache, f, default_flow_style=False, sort_keys=True, allow_unicode=True)
+        _openfda_disk_cache_dirty = False
+        print(f"💾 Saved OpenFDA cache to {path}")
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to save OpenFDA cache ({path}): {e}")
+
+atexit.register(save_openfda_disk_cache)
+
+_openfda_epc_cache = {}
+
+
+def _query_openfda_epc(query: str) -> Optional[Dict[str, List[str]]]:
+    """
+    Query openFDA for Established Pharmacologic Class (EPC) for a drug name.
+    
+    Tries three search strategies in order:
+      1. openfda.substance_name (uppercase, most precise)
+      2. openfda.generic_name
+      3. openfda.brand_name
+    For each strategy, scans up to 5 results and prefers a hit where the
+    queried name appears in the substance_name (to avoid combination-drug
+    false matches).
+    """
+    global _openfda_disk_cache_dirty
+    q_upper = query.upper()
+    cache_enabled = _use_openfda_cache()
+    if cache_enabled:
+        cache = _ensure_openfda_disk_cache()['epc']
+        if q_upper in cache:
+            val = cache[q_upper]
+            if val is None:
+                llm_val = _query_llm_for_pharm_class(query)
+                if llm_val:
+                    cache[q_upper] = llm_val
+                    _openfda_disk_cache_dirty = True
+                    return llm_val
+            return val
+
+    strategies = [
+        f"openfda.substance_name:\"{urllib.parse.quote(q_upper)}\"+AND+%28_exists_:openfda.pharm_class_epc+OR+_exists_:openfda.pharm_class_pe%29",
+        f"openfda.generic_name:\"{urllib.parse.quote(query)}\"+AND+%28_exists_:openfda.pharm_class_epc+OR+_exists_:openfda.pharm_class_pe%29",
+        f"openfda.brand_name:\"{urllib.parse.quote(query)}\"+AND+%28_exists_:openfda.pharm_class_epc+OR+_exists_:openfda.pharm_class_pe%29",
+    ]
+
+    api_key = CONFIG.get('openfda_api', {}).get('api_key', '') or os.getenv('OPENFDA_API_KEY', '')
+    api_key_param = f"&api_key={api_key}" if api_key else ""
+
+    for strategy in strategies:
+        url = f"https://api.fda.gov/drug/label.json?search={strategy}&limit=5{api_key_param}"
+        retries = 3
+        while retries > 0:
+            try:
+                r = requests.get(url, timeout=6)
+                if r.status_code == 429:
+                    time.sleep(2.0)
+                    retries -= 1
+                    continue
+                if r.status_code != 200:
+                    break
+                
+                results = r.json().get('results', [])
+
+                # First pass: prefer a result where queried substance appears and has EPC or PE
+                for res in results:
+                    openfda = res.get('openfda', {})
+                    substances = [s.upper() for s in openfda.get('substance_name', [])]
+                    epc = openfda.get('pharm_class_epc', [])
+                    pe = openfda.get('pharm_class_pe', [])
+                    if (epc or pe) and any(q_upper in s for s in substances):
+                        ans = {'epc': epc, 'pe': pe}
+                        if cache_enabled:
+                            _ensure_openfda_disk_cache()['epc'][q_upper] = ans
+                            _openfda_disk_cache_dirty = True
+                        return ans
+
+                # Second pass: any result with EPC or PE (relaxed match)
+                for res in results:
+                    openfda = res.get('openfda', {})
+                    epc = openfda.get('pharm_class_epc', [])
+                    pe = openfda.get('pharm_class_pe', [])
+                    if epc or pe:
+                        ans = {'epc': epc, 'pe': pe}
+                        if cache_enabled:
+                            _ensure_openfda_disk_cache()['epc'][q_upper] = ans
+                            _openfda_disk_cache_dirty = True
+                        return ans
+                
+                break # 200 OK but no EPC found, stop retrying this strategy
+
+            except Exception:
+                break
+                
+    # Fallback to LLM since OpenFDA returned no structured results
+    llm_val = _query_llm_for_pharm_class(query)
+    if cache_enabled:
+        _ensure_openfda_disk_cache()['epc'][q_upper] = llm_val
+        _openfda_disk_cache_dirty = True
+    return llm_val
+
+
+def _query_llm_for_pharm_class(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Fallback function using Gemini to resolve drug Established Pharmacologic Class (EPC)
+    and Physiological Effect (PE) when OpenFDA fails.
+    """
+    from google import genai
+    from google.genai import types
+    import json
+
+    ai_config = CONFIG.get('ai_processing', {})
+    api_key_env = ai_config.get('api_key_env', 'GEMINI_API_KEY')
+    gemini_api_key = os.getenv(api_key_env, '')
+
+    try:
+        # Initialize Google GenAI client (Vertex AI mode matching initialize_gemini_models)
+        client = genai.Client(
+            vertexai=True,
+            project="project-0b52e79a-4960-471d-9d8",
+            location="us-central1"
+        )
+        
+        prompt = f"""
+        Analyze the drug substance or product name: "{query}"
+        Identify its FDA Established Pharmacologic Class (EPC) and Physiological Effect (PE) if they exist.
+        Also, provide a short, credible medical database or labeling source name for this class information (e.g. NCI Thesaurus, DailyMed, RxNorm, or FDA Innohep Label).
+        
+        Provide your output strictly in JSON format as a dictionary with three keys:
+        - "epc": a list of strings representing the EPC class names (e.g. ["Low Molecular Weight Heparin [EPC]"])
+        - "pe": a list of strings representing the PE names (e.g. ["Decreased Coagulation Activity [PE]"])
+        - "source": a string naming the source (e.g. "NCI Thesaurus")
+        
+        If it is a combination drug, you can list the classes for all components.
+        If it is not a real drug, return empty lists and "Unknown Source".
+        
+        JSON:
+        """
+        
+        # Exponential backoff retry mechanism to survive Vertex 429s
+        import random
+        import time
+        retries = 5
+        delay = 1.0
+        response = None
+        
+        while retries > 0:
+            try:
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                if response and response.text:
+                    break
+            except Exception as e:
+                if '429' in str(e) or 'Resource exhausted' in str(e):
+                    # Back off and wait
+                    sleep_time = delay + random.uniform(0, 1)
+                    time.sleep(sleep_time)
+                    delay *= 2
+                    retries -= 1
+                else:
+                    raise e
+                    
+        if not response or not response.text:
+            return None
+            
+        data = json.loads(response.text)
+        if isinstance(data, dict) and 'epc' in data and 'pe' in data:
+            data.setdefault('source', 'LLM Medical Knowledge')
+            return data
+    except Exception as e:
+        print(f"⚠️ Warning: LLM pharmacologic class fallback failed for '{query}': {e}")
+    return None
+
+
+
+
+def _check_openfda_withdrawn(query: str) -> bool:
+    global _openfda_disk_cache_dirty
+    q_upper = query.upper()
+    cache_enabled = _use_openfda_cache()
+    if cache_enabled:
+        cache = _ensure_openfda_disk_cache()['withdrawn']
+        if q_upper in cache:
+            return cache[q_upper]
+
+    strategies = [
+        f"products.active_ingredients.name:\"{urllib.parse.quote(q_upper)}\"",
+        f"products.brand_name:\"{urllib.parse.quote(q_upper)}\"",
+        f"openfda.generic_name:\"{urllib.parse.quote(query)}\"",
+        f"openfda.brand_name:\"{urllib.parse.quote(query)}\"",
+    ]
+    
+    api_key = CONFIG.get('openfda_api', {}).get('api_key', '')
+    api_key_param = f"&api_key={api_key}" if api_key else ""
+
+    for strategy in strategies:
+        url = f"https://api.fda.gov/drug/drugsfda.json?search={strategy}&limit=100{api_key_param}"
+        retries = 3
+        while retries > 0:
+            try:
+                r = requests.get(url, timeout=6)
+                if r.status_code == 429:
+                    time.sleep(2.0)
+                    retries -= 1
+                    continue
+                if r.status_code != 200:
+                    break
+                
+                results = r.json().get('results', [])
+                
+                has_active = False
+                has_discontinued = False
+                
+                for res in results:
+                    for p in res.get('products', []):
+                        status = p.get('marketing_status', '').upper()
+                        if status in ['DISCONTINUED', 'WITHDRAWN', 'PRESCRIPTION - DISCONTINUED']:
+                            has_discontinued = True
+                        elif status:
+                            has_active = True
+                
+                # If we found any active product on the market, it's not withdrawn
+                if has_active:
+                    _openfda_withdrawn_cache[q_upper] = False
+                    return False
+                    
+                # If everything we found is discontinued, it is withdrawn
+                if has_discontinued and not has_active:
+                    _openfda_withdrawn_cache[q_upper] = True
+                    return True
+            except Exception:
+                break
+                
+    if cache_enabled:
+        _ensure_openfda_disk_cache()['withdrawn'][q_upper] = False
+        _openfda_disk_cache_dirty = True
+    return False
+
+_openfda_label_exists_cache = {}
+
+def _check_openfda_label_exists(query: str) -> bool:
+    q_upper = query.upper()
+    if q_upper in _openfda_label_exists_cache:
+        return _openfda_label_exists_cache[q_upper]
+
+    strategies = [
+        f"openfda.substance_name:\"{urllib.parse.quote(q_upper)}\"",
+        f"openfda.generic_name:\"{urllib.parse.quote(query)}\"",
+        f"openfda.brand_name:\"{urllib.parse.quote(query)}\"",
+    ]
+    
+    api_key = CONFIG.get('openfda_api', {}).get('api_key', '')
+    api_key_param = f"&api_key={api_key}" if api_key else ""
+
+    for strategy in strategies:
+        url = f"https://api.fda.gov/drug/label.json?search={strategy}&limit=1{api_key_param}"
+        retries = 3
+        while retries > 0:
+            try:
+                r = requests.get(url, timeout=6)
+                if r.status_code == 429:
+                    time.sleep(2.0)
+                    retries -= 1
+                    continue
+                if r.status_code == 200:
+                    _openfda_label_exists_cache[q_upper] = True
+                    return True
+                break
+            except Exception:
+                break
+                
+    _openfda_label_exists_cache[q_upper] = False
+    return False
+
+
+def fetch_openfda_pharm_class(interventions: List[str]) -> tuple[str, str]:
+    if not interventions:
+        return "N/A", "N/A"
+        
+    has_epc_list = []
+    no_epc_list = []
+    has_pe_list = []
+    no_pe_list = []
+    stop_words = {'vaccination', 'vaccine', 'with', 'injection', 'of', 'for', 'dose', 'regimen', 'therapy', 'treatment', 'placebo', 'saline', 'adjuvant', 'and'}
+    
+    def _process_intv(intv):
+        if not intv or intv == 'N/A': return None
+        clean_name = re.sub(r'^[^:]+:\s*', '', intv).strip().lower()
+        if not clean_name: return None
+        
+        words = clean_name.replace('-', ' ').split()
+        clean_words = [w for w in words if w not in stop_words]
+        
+        for length in range(len(clean_words), 0, -1):
+            for start in range(len(clean_words) - length + 1):
+                query = " ".join(clean_words[start:start+length])
+                if len(query) < 4 and length < len(clean_words): continue
+                
+                data = _query_openfda_epc(query)
+                if data:
+                    return clean_name, data, False, False
+
+        # If not found, check withdrawn and label exists
+        base_query = " ".join(clean_words)
+        is_withdrawn = _check_openfda_withdrawn(base_query)
+        label_exists = False
+        if not is_withdrawn:
+            label_exists = _check_openfda_label_exists(base_query)
+            
+        return clean_name, None, is_withdrawn, label_exists
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(interventions))) as executor:
+        results = list(executor.map(_process_intv, interventions))
+        
+    for res in results:
+        if not res: continue
+        clean_name, data, is_withdrawn, label_exists = res
+        
+        if data:
+            epc = data.get('epc', [])
+            pe = data.get('pe', [])
+            source = data.get('source')
+            source_suffix = f" (Source: LLM - {source})" if source else ""
+            
+            if epc:
+                has_epc_list.append(f"{', '.join(epc)} [{clean_name.upper()}]{source_suffix}")
+            else:
+                no_epc_list.append(f"Missing from FDA Label [{clean_name.upper()}]{source_suffix}")
+                
+            if pe:
+                has_pe_list.append(f"{', '.join(pe)} [{clean_name.upper()}]{source_suffix}")
+            else:
+                no_pe_list.append(f"Missing from FDA Label [{clean_name.upper()}]{source_suffix}")
+        else:
+            if is_withdrawn:
+                no_epc_list.append(f"Withdrawn [{clean_name.upper()}]")
+                no_pe_list.append(f"Withdrawn [{clean_name.upper()}]")
+            elif label_exists:
+                no_epc_list.append(f"Missing from FDA Label [{clean_name.upper()}]")
+                no_pe_list.append(f"Missing from FDA Label [{clean_name.upper()}]")
+            else:
+                no_epc_list.append(f"Not Found in FDA Database [{clean_name.upper()}]")
+                no_pe_list.append(f"Not Found in FDA Database [{clean_name.upper()}]")
+        
+    epc_str = "\n".join(has_epc_list + no_epc_list) if (has_epc_list or no_epc_list) else "N/A"
+    pe_str = "\n".join(has_pe_list + no_pe_list) if (has_pe_list or no_pe_list) else "N/A"
+    return epc_str, pe_str
+
+
+
+
+def _query_openfda_earliest_approval(query: str) -> Optional[str]:
+    global _openfda_disk_cache_dirty
+    q_upper = query.upper()
+    cache_enabled = _use_openfda_cache()
+    if cache_enabled:
+        cache = _ensure_openfda_disk_cache()['approval_date']
+        if q_upper in cache:
+            return cache[q_upper]
+        
+    strategies = [
+        f"openfda.substance_name:\"{urllib.parse.quote(q_upper)}\"",
+        f"openfda.generic_name:\"{urllib.parse.quote(query)}\"",
+        f"openfda.brand_name:\"{urllib.parse.quote(query)}\"",
+    ]
+    
+    api_key = CONFIG.get('openfda_api', {}).get('api_key', '') or os.getenv('OPENFDA_API_KEY', '')
+    api_key_param = f"&api_key={api_key}" if api_key else ""
+    
+    # We use drugsfda endpoint because it has the submissions data
+    for strategy in strategies:
+        url = f"https://api.fda.gov/drug/drugsfda.json?search={strategy}&limit=100{api_key_param}"
+        retries = 3
+        while retries > 0:
+            try:
+                r = requests.get(url, timeout=6)
+                if r.status_code == 429:
+                    time.sleep(2.0)
+                    retries -= 1
+                    continue
+                if r.status_code != 200:
+                    break
+                    
+                results = r.json().get('results', [])
+                dates = []
+                for res in results:
+                    for sub in res.get('submissions', []):
+                        if sub.get('submission_status') == 'AP' and sub.get('submission_status_date'):
+                            dates.append(sub.get('submission_status_date'))
+                            
+                if dates:
+                    earliest = min(dates)
+                    if cache_enabled:
+                        _ensure_openfda_disk_cache()['approval_date'][q_upper] = earliest
+                        _openfda_disk_cache_dirty = True
+                    return earliest
+                    
+                break # 200 OK but no submissions found, stop retrying this strategy
+            except Exception:
+                break
+                
+    if cache_enabled:
+        _ensure_openfda_disk_cache()['approval_date'][q_upper] = None
+        _openfda_disk_cache_dirty = True
+    return None
+
+def fetch_openfda_approval_before_trial(interventions: List[str], trial_start_date: str) -> str:
+    if not interventions or not trial_start_date or trial_start_date == 'N/A':
+        return "N/A"
+        
+    # parse trial start date
+    try:
+        from dateutil import parser
+        import datetime
+        default_date = datetime.datetime(2000, 1, 1)
+        parsed = parser.parse(trial_start_date, default=default_date)
+        trial_date_str = parsed.strftime("%Y%m%d")
+    except Exception:
+        return "N/A (Invalid Trial Date)"
+        
+    results = []
+    stop_words = {'vaccination', 'vaccine', 'with', 'injection', 'of', 'for', 'dose', 'regimen', 'therapy', 'treatment', 'placebo', 'saline', 'adjuvant', 'and'}
+    
+    def _process_approval(intv):
+        if not intv or intv == 'N/A': return None
+        clean_name = re.sub(r'^[^:]+:\s*', '', intv).strip().lower()
+        if not clean_name: return None
+        
+        words = clean_name.replace('-', ' ').split()
+        clean_words = [w for w in words if w not in stop_words]
+        
+        for length in range(len(clean_words), 0, -1):
+            for start in range(len(clean_words) - length + 1):
+                query = " ".join(clean_words[start:start+length])
+                if len(query) < 4 and length < len(clean_words): continue
+                
+                earliest_approval = _query_openfda_earliest_approval(query)
+                if earliest_approval:
+                    return clean_name, earliest_approval
+                    
+        return clean_name, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(interventions))) as executor:
+        futures_results = list(executor.map(_process_approval, interventions))
+        
+    for res in futures_results:
+        if not res: continue
+        clean_name, earliest_approval = res
+        if earliest_approval:
+            if earliest_approval < trial_date_str:
+                results.append(f"TRUE [{clean_name.upper()}]")
+            else:
+                results.append(f"FALSE [{clean_name.upper()}]")
+        else:
+            results.append(f"Not Found in FDA Database [{clean_name.upper()}]")
+
+    return "\n".join(results) if results else "N/A"
+
+
+
+# ============================================================================
+# ICD-11 API
+# ============================================================================
+
+_icd_token: Optional[str] = None
+_icd_token_expiry: float = 0.0
+_icd_disk_cache: Optional[Dict[str, Any]] = None
+_icd_disk_cache_dirty = False
+
+
+def _icd_cache_file() -> str:
+    return CONFIG.get('icd_api', {}).get('cache_file', 'icd_cache.yaml')
+
+
+def _ensure_icd_disk_cache() -> Dict[str, Any]:
+    global _icd_disk_cache
+    if _icd_disk_cache is not None:
+        return _icd_disk_cache
+
+    path = _icd_cache_file()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = yaml.safe_load(f)
+            _icd_disk_cache = loaded if isinstance(loaded, dict) else {}
+            print(f"✅ Loaded ICD cache from {path} ({len(_icd_disk_cache)} entries)")
+        except Exception as e:
+            print(f"⚠️ Could not load ICD cache ({path}): {e}")
+            _icd_disk_cache = {}
+    else:
+        _icd_disk_cache = {}
+    return _icd_disk_cache
+
+
+def save_icd_disk_cache() -> None:
+    """Persist ICD cache to disk if it has been modified."""
+    global _icd_disk_cache_dirty
+    if not _icd_disk_cache_dirty or _icd_disk_cache is None:
+        return
+    path = _icd_cache_file()
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(_icd_disk_cache, f, default_flow_style=False,
+                           sort_keys=True, allow_unicode=True)
+        _icd_disk_cache_dirty = False
+        print(f"💾 Saved ICD cache to {path}")
+    except Exception as e:
+        print(f"⚠️ Failed to save ICD cache ({path}): {e}")
+
+
+atexit.register(save_icd_disk_cache)
+
+
+def _get_icd_token() -> Optional[str]:
+    """Fetch (or reuse a cached) OAuth2 bearer token for the ICD-11 API."""
+    global _icd_token, _icd_token_expiry
+
+    if _icd_token and time.time() < _icd_token_expiry - 60:
+        return _icd_token
+
+    icd_config = CONFIG.get('icd_api', {})
+    # Prefer env vars, fall back to inline config values
+    client_id = os.getenv(icd_config.get('client_id_env', ''), '') or icd_config.get('client_id', '')
+    client_secret = os.getenv(icd_config.get('client_secret_env', ''), '') or icd_config.get('client_secret', '')
+
+    if not client_id or not client_secret:
+        print("⚠️ ICD API credentials not configured (client_id / client_secret missing)")
+        return None
+
+    try:
+        r = requests.post(
+            "https://icdaccessmanagement.who.int/connect/token",
+            data={
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'scope': 'icdapi_access',
+                'grant_type': 'client_credentials',
+            },
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            _icd_token = data.get('access_token')
+            expires_in = data.get('expires_in', 3600)
+            _icd_token_expiry = time.time() + expires_in
+            return _icd_token
+        else:
+            print(f"⚠️ ICD token request failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ ICD token request error: {e}")
+    return None
+
+
+def _search_icd_condition(condition: str) -> Optional[Dict[str, str]]:
+    """Search ICD-11 MMS for a condition string.
+    
+    Returns a dict {'code': str, 'title': str, 'block': str} for the best match, or None.
+    Cache stores these dicts (or None for not-found). Old string-format
+    cache entries are treated as misses so they get re-fetched.
+    """
+    global _icd_disk_cache_dirty
+
+    cache = _ensure_icd_disk_cache()
+    cache_key = condition.lower().strip()
+    if cache_key in cache:
+        val = cache[cache_key]
+        # Treat old string-format entries as misses so they get re-fetched
+        if val is None or isinstance(val, dict):
+            # If the cached dictionary doesn't have 'block', treat as miss to force re-fetch
+            if val is None or 'block' in val:
+                return val
+
+    token = _get_icd_token()
+    if not token:
+        return None
+
+    icd_config = CONFIG.get('icd_api', {})
+    release_id = icd_config.get('release_id', '2024-01')
+    url = f"https://id.who.int/icd/release/11/{release_id}/mms/search"
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json',
+        'API-Version': 'v2',
+        'Accept-Language': 'en',
+    }
+
+    try:
+        r = requests.get(
+            url,
+            params={'q': condition, 'useFlexisearch': 'true', 'flatResults': 'true'},
+            headers=headers,
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            entities = data.get('destinationEntities', [])
+            if entities:
+                # Use the top match
+                best = entities[0]
+                title = re.sub(r'<[^>]+>', '', best.get('title', '')).strip()
+                code = best.get('theCode', '')
+                
+                block_title = 'Unknown'
+                entity_id = best.get('id')
+                if entity_id and code:
+                    try:
+                        r2 = requests.get(entity_id, headers=headers, timeout=5)
+                        if r2.status_code == 200:
+                            data2 = r2.json()
+                            parent_urls = data2.get('parent', [])
+                            if parent_urls:
+                                r3 = requests.get(parent_urls[0], headers=headers, timeout=5)
+                                if r3.status_code == 200:
+                                    parent_data = r3.json()
+                                    ptitle = parent_data.get('title', {})
+                                    if isinstance(ptitle, dict):
+                                        block_title = ptitle.get('@value', 'Unknown')
+                                    else:
+                                        block_title = str(ptitle)
+                    except Exception as e:
+                        print(f"⚠️ ICD block lookup error for '{condition}': {e}")
+                        
+                result = {'code': code, 'title': title, 'block': block_title} if code else None
+            else:
+                result = None
+            cache[cache_key] = result
+            _icd_disk_cache_dirty = True
+            return result
+        elif r.status_code == 401:
+            global _icd_token
+            _icd_token = None
+    except Exception as e:
+        print(f"⚠️ ICD search error for '{condition}': {e}")
+    return None
+
+
+# ICD-11 chapter lookup by first character of the code
+_ICD11_CHAPTERS: Dict[str, str] = {
+    '1': 'Certain infectious or parasitic diseases',
+    '2': 'Neoplasms',
+    '3': 'Diseases of the blood or blood-forming organs',
+    '4': 'Diseases of the immune system',
+    '5': 'Endocrine, nutritional or metabolic diseases',
+    '6': 'Mental, behavioural or neurodevelopmental disorders',
+    '7': 'Sleep-wake disorders',
+    '8': 'Diseases of the nervous system',
+    '9': 'Diseases of the visual system',
+    'A': 'Diseases of the ear or mastoid process',
+    'B': 'Diseases of the circulatory system',
+    'C': 'Diseases of the respiratory system',
+    'D': 'Diseases of the digestive system',
+    'E': 'Diseases of the skin',
+    'F': 'Diseases of the musculoskeletal system or connective tissue',
+    'G': 'Diseases of the genitourinary system',
+    'H': 'Conditions related to sexual health',
+    'J': 'Pregnancy, childbirth or the puerperium',
+    'K': 'Certain conditions originating in the perinatal period',
+    'L': 'Developmental anomalies',
+    'M': 'Symptoms, signs or clinical findings, not elsewhere classified',
+    'N': 'Injury, poisoning or certain other consequences of external causes',
+    'P': 'External causes of morbidity or mortality',
+    'Q': 'Factors influencing health status or contact with health services',
+    'R': 'Codes for special purposes',
+    'S': 'Supplementary chapter - Traditional Medicine',
+}
+
+
+def _icd_chapter_from_code(code: str) -> str:
+    """Return the ICD-11 chapter name from the first character of a code."""
+    if not code:
+        return 'Unknown'
+    return _ICD11_CHAPTERS.get(code[0].upper(), 'Unknown')
+
+
+def fetch_icd_codes(conditions: List[str]) -> Tuple[str, str, str, str, str]:
+    """Look up ICD-11 codes for a list of condition strings.
+    
+    Returns a 5-tuple:
+      - primary_code:    ICD-11 code for the first/primary condition (e.g. '5A11')
+      - primary_title:   ICD-11 title for the primary condition
+      - icd_block:       ICD-11 block for the primary condition
+      - icd_category:    Top-level chapter for the primary condition
+                         (e.g. 'Endocrine, nutritional or metabolic diseases')
+      - secondary_codes: Pipe-separated codes for any additional conditions
+                         (e.g. 'Hypertension: Essential (primary) hypertension (BA00) | ...')
+    """
+    na = ("N/A", "N/A", "N/A", "N/A", "N/A")
+    if not CONFIG.get('icd_api', {}).get('enabled', False):
+        return na
+
+    valid = [c for c in conditions if c and c != 'N/A']
+    if not valid:
+        return na
+
+    primary_code = "N/A"
+    primary_title = "N/A"
+    icd_block = "N/A"
+    icd_category = "N/A"
+    secondary_parts = []
+
+    for i, condition in enumerate(valid):
+        match = _search_icd_condition(condition)
+        if i == 0:
+            if match:
+                primary_code = match['code']
+                primary_title = match['title']
+                icd_block = match.get('block', 'Unknown')
+                icd_category = _icd_chapter_from_code(match['code'])
+            else:
+                primary_code = 'Not found'
+                primary_title = 'Not found'
+                icd_block = 'Unknown'
+                icd_category = 'Unknown'
+        else:
+            if match:
+                secondary_parts.append(f"{condition}: {match['title']} ({match['code']})")
+            else:
+                secondary_parts.append(f"{condition}: Not found")
+
+    secondary_codes = " | ".join(secondary_parts) if secondary_parts else "N/A"
+    return primary_code, primary_title, icd_block, icd_category, secondary_codes
+
+
 
 def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     """
@@ -815,7 +1614,16 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     overall_status = status.get('overallStatus', 'N/A')
     start_date_struct = status.get('startDateStruct', {})
     start_date = start_date_struct.get('date', 'N/A')
-    start_year = start_date.split('-')[0] if start_date != 'N/A' and '-' in start_date else 'N/A'
+    start_year = "N/A"
+    if start_date != 'N/A':
+        match = re.search(r'\b(\d{4})\b', start_date)
+        if match:
+            start_year = match.group(1)
+            
+    primary_completion_date = status.get('primaryCompletionDateStruct', {}).get('date', 'N/A')
+    completion_date = status.get('completionDateStruct', {}).get('date', 'N/A')
+    first_posted_date = status.get('studyFirstPostDateStruct', {}).get('date', 'N/A')
+    last_update_date = status.get('lastUpdatePostDateStruct', {}).get('date', 'N/A')
     
     # Sponsors and Funders
     sponsor_module = protocol_section.get('sponsorCollaboratorsModule', {})
@@ -854,6 +1662,18 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     healthy_volunteers = eligibility.get('healthyVolunteers', 'N/A')
     criteria_text = eligibility.get('eligibilityCriteria', 'N/A')
     
+    applicable = "TRUE"
+    if gender.upper() == "MALE":
+        applicable = "FALSE"
+    
+    parsed_min = parse_age_in_years(min_age)
+    parsed_max = parse_age_in_years(max_age)
+    
+    if parsed_max is not None and parsed_max < 18:
+        applicable = "FALSE"
+    if parsed_min is not None and parsed_min > 55:
+        applicable = "FALSE"
+    
     # Description
     description = protocol_section.get('descriptionModule', {})
     brief_summary = description.get('briefSummary', 'N/A')
@@ -865,16 +1685,41 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     unique_countries = sorted(list(set(loc.get('country', 'N/A') for loc in locations if 'country' in loc)))
     location_str = ', '.join(unique_countries) if unique_countries else 'N/A'
     
-    # Detailed sites for AI counting
+    # Detailed sites — one entry per location
     sites_list = []
+    city_counts: Dict[str, int] = {}
+    province_counts: Dict[str, int] = {}
+
     for loc in locations:
-        facility = loc.get('facility', 'Unknown Facility')
-        country = loc.get('country', 'Unknown Country')
-        sites_list.append(f"• {facility} ({country})")
-    sites_detail_str = '\n'.join(sites_list) if sites_list else 'N/A'
+        facility = loc.get('facility', '').strip()
+        if not facility: facility = '[Missing Facility]'
+        
+        city = loc.get('city', '').strip()
+        state = loc.get('state', '').strip()
+        
+        country = loc.get('country', '').strip()
+        if not country: country = '[Missing Country]'
+
+        detail_parts = [facility]
+        detail_parts.append(city if city else '[Missing City]')
+        detail_parts.append(state if state else '[Missing Province/State]')
+        detail_parts.append(f"({country})")
+        
+        sites_list.append(', '.join(detail_parts))
+
+        city_key = city if city else '[Missing City]'
+        city_counts[city_key] = city_counts.get(city_key, 0) + 1
+
+        province_key = state if state else '[Missing Province/State]'
+        province_counts[province_key] = province_counts.get(province_key, 0) + 1
+
+    sites_detail_str    = '; '.join(sites_list) if sites_list else 'N/A'
+    sites_cities_str    = '; '.join(f"{c} ({n})" for c, n in city_counts.items()) if city_counts else 'N/A'
+    sites_provinces_str = '; '.join(f"{p} ({n})" for p, n in province_counts.items()) if province_counts else 'N/A'
     
-    sites_detail_str = '\n'.join(sites_list) if sites_list else 'N/A'
-    
+    # New Columns
+    site_count_type = "Multi-site" if len(locations) > 1 else ("Single-site" if len(locations) == 1 else "Unknown/None")
+    has_canadian_site = "TRUE" if "Canada" in unique_countries else "FALSE"
     # Arms and Interventions
     arms_interventions = protocol_section.get('armsInterventionsModule', {})
     
@@ -894,7 +1739,7 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
         # Track which interventions are explicitly mapped to an EXPERIMENTAL arm
         if 'EXPERIMENTAL' in a_type.upper():
             for mapped_int in arm.get('interventionNames', []):
-                clean_int = mapped_int.split(': ')[-1].strip().lower() if ': ' in mapped_int else mapped_int.strip().lower()
+                clean_int = mapped_int.split(': ', 1)[-1].strip().lower() if ': ' in mapped_int else mapped_int.strip().lower()
                 experimental_interventions.add(clean_int)
     arm_groups_str = '\n'.join(arm_groups_list) if arm_groups_list else 'N/A'
     
@@ -931,6 +1776,9 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
     
     health_canada_approval_str = fetch_health_canada_approval(intervention_names)
     fda_status_str, fda_safety_str, preg_contra_str, lact_contra_str, cited_str = fetch_fda_info(intervention_names, nct_id)
+    openfda_pharm_class_epc_str, openfda_pharm_class_pe_str = fetch_openfda_pharm_class(intervention_names)
+    openfda_approved_before_trial_str = fetch_openfda_approval_before_trial(intervention_names, start_date)
+    icd_primary_code, icd_primary_title, icd_block, icd_category, icd_secondary_codes = fetch_icd_codes(conditions)
     
     # Calculate Consistency
     consistency_str = "N/A"
@@ -1006,9 +1854,14 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
         'overall_status': overall_status,
         'study_type': study_type,
         'start_date': start_date,
+        'primary_completion_date': primary_completion_date,
+        'completion_date': completion_date,
+        'first_posted_date': first_posted_date,
+        'last_update_date': last_update_date,
         'gender': gender,
         'minimum_age': min_age,
         'maximum_age': max_age,
+        'Applicable': applicable,
         'healthy_volunteers': healthy_volunteers,
         'brief_summary': brief_summary,
         'detailed_description': detailed_description,
@@ -1017,6 +1870,10 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
         'location': location_str,
         'countries_str': location_str,
         'sites_detail': sites_detail_str,
+        'sites_cities': sites_cities_str,
+        'sites_provinces': sites_provinces_str,
+        'site_count_type': site_count_type,
+        'has_canadian_site': has_canadian_site,
         'phase': phase_str,
         'enrollment': enrollment,
         'results_link': results_link,
@@ -1028,6 +1885,14 @@ def transform_study_data(study: Dict[Any, Any]) -> Dict[str, Any]:
         'FDA Pregnancy Status': preg_contra_str,
         'FDA Lactation Status': lact_contra_str,
         'Cited in FDA Label': cited_str,
+        'Approved Before Trial': openfda_approved_before_trial_str,
+        'OpenFDA Pharmacologic Class (EPC)': openfda_pharm_class_epc_str,
+        'OpenFDA Pharmacologic Class (PE)': openfda_pharm_class_pe_str,
+        'ICD-11 Primary Code': icd_primary_code,
+        'ICD-11 Primary Title': icd_primary_title,
+        'ICD-11 Block': icd_block,
+        'ICD-11 Category': icd_category,
+        'ICD-11 Secondary Codes': icd_secondary_codes,
         'Approval Consistency': consistency_str,
         'intervention_types': intervention_types_str,
         'intervention_names': intervention_names_str,
@@ -1064,12 +1929,16 @@ def initialize_gemini_models() -> Dict[str, Dict[str, Any]]:
     gemini_api_key = os.getenv(api_key_env, '')
     
     if not gemini_api_key:
-        print(f"❌ {api_key_env} environment variable not set")
-        print(f"   Set it with: export {api_key_env}='your-api-key'")
-        return {}
+        print(f"⚠️  {api_key_env} environment variable not set. Vertex AI client will attempt to use Google Cloud Application Default Credentials (ADC).")
     
     try:
-        client = genai.Client(api_key=gemini_api_key)
+        # Initialize Google GenAI client for Vertex AI
+        client = genai.Client(
+            vertexai=True,
+            project="project-0b52e79a-4960-471d-9d8",
+            location="us-central1"
+        )
+
         model_name = ai_config.get('model', 'gemini-2.5-flash')
         _ACTUAL_GEMINI_MODEL = model_name
         
@@ -1152,10 +2021,14 @@ def process_study_with_ai(model_ctx: Dict[str, Any], study_data: Dict[str, Any])
     Returns:
         Optional[str]: AI-determined value or None if failed
     """
+    class SafeDict(dict):
+        def __missing__(self, key):
+            return 'N/A'
+
     # Format the row prompt with study data
     ai_config = CONFIG.get('ai_processing', {})
     row_prompt_template = ai_config.get('row_prompt_template', '')
-    row_prompt = row_prompt_template.format(**study_data)
+    row_prompt = row_prompt_template.format_map(SafeDict(study_data))
 
     # Get AI response (context already set via system instruction)
     result = get_gemini_response(model_ctx, row_prompt)
@@ -1195,69 +2068,168 @@ def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, A
         print("❌ No columns to process. AI processing is required.")
         sys.exit(1)
         
+    output_config = CONFIG.get('output', {})
+    filename = output_config.get('csv_filename', 'clinical_trials_filtered.csv')
+    json_filename = output_config.get('json_filename')
+    if not json_filename:
+        json_filename = os.path.splitext(filename)[0] + '.json'
+    
+    use_cache = ai_config.get('use_cache', True)
+    cache_file = ai_config.get('cache_file', 'ai_cache.json')
+    
+    existing_ai_data = {}
+    if use_cache:
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    existing_ai_data = json.load(f)
+                print(f"📖 Loaded {len(existing_ai_data)} cached AI results from {cache_file}")
+            except Exception as e:
+                print(f"⚠️ Could not load AI cache file {cache_file}: {e}")
+        elif os.path.exists(json_filename):
+            try:
+                with open(json_filename, 'r', encoding='utf-8') as f:
+                    saved_studies = json.load(f)
+                    for study in saved_studies:
+                        nct_id = study.get('nct_id')
+                        if nct_id:
+                            ai_vals = {col.get('name'): study.get(col.get('name')) for col in columns if study.get(col.get('name')) and study.get(col.get('name')) != 'N/A'}
+                            if ai_vals:
+                                existing_ai_data[nct_id] = ai_vals
+                print(f"📖 Loaded existing AI data for {len(existing_ai_data)} trials from {json_filename}")
+            except Exception as e:
+                print(f"⚠️ Could not load existing JSON to resume: {e}")
+        elif os.path.exists(filename):
+            try:
+                with open(filename, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        nct_id = row.get('nct_id')
+                        if nct_id:
+                            ai_vals = {col.get('name'): row.get(col.get('name')) for col in columns if row.get(col.get('name')) and row.get(col.get('name')) != 'N/A'}
+                            if ai_vals:
+                                existing_ai_data[nct_id] = ai_vals
+                print(f"📖 Loaded existing AI data for {len(existing_ai_data)} trials from {filename}")
+            except Exception as e:
+                print(f"⚠️ Could not load existing CSV to resume: {e}")
+
     # Determine which studies to process
-    max_ai_rows = ai_config.get('max_rows')
-    if max_ai_rows is None:
-        studies_to_process = studies
-        remaining_studies = []
-        limit_msg = "all"
-    else:
-        studies_to_process = studies[:max_ai_rows]
-        remaining_studies = studies[max_ai_rows:]
-        limit_msg = f"first {max_ai_rows}"
+    max_new_calls = ai_config.get('max_rows', 250)
     
-    # Filter to only tuning trials if debug mode is enabled
-    if ai_config.get('debug_only_tuning_trials', False):
-        tuning_trials = CONFIG.get('tuning_trials', [])
-        tuning_trials_set = set(tuning_trials)
-        original_count = len(studies_to_process)
-        filtered_tuning = [s for s in studies_to_process if s.get('nct_id') in tuning_trials_set]
-        filtered_out = [s for s in studies_to_process if s.get('nct_id') not in tuning_trials_set]
-        studies_to_process = filtered_tuning
-        remaining_studies.extend(filtered_out)
-        if original_count != len(studies_to_process):
-            print(f"🔍 Debug mode: Filtered to {len(studies_to_process)} tuning trials (from {original_count} studies)")
-    
-    ai_config = CONFIG.get('ai_processing', {})
     model_name = ai_config.get('model', 'gemini-2.5-flash')
     
-    total_studies = len(studies_to_process)
-    print(f"\n🤖 Transforming {len(studies_to_process)} studies with Gemini AI ({limit_msg} studies)...")
+    print(f"\n🤖 Transforming studies with Gemini AI (Max {max_new_calls} new AI evaluations)...")
     print(f"   Model: {model_name}")
     print("-" * 60)
     
     processed_studies = []
+    remaining_studies = []
+    new_processed_count = 0
+ 
+    try:
+        for i, study in enumerate(studies):
+            nct_id = study.get('nct_id', 'Unknown')
+            
+            # Check if we already have it
+            if nct_id in existing_ai_data:
+                for col_name, val in existing_ai_data[nct_id].items():
+                    study[col_name] = val
+                processed_studies.append(study)
+                continue
 
-    for i, study in enumerate(studies_to_process):
-        nct_id = study.get('nct_id', 'Unknown')
-        print(f"  [{i+1}/{total_studies}] Processing {nct_id}...", end=' ', flush=True)
+            # Skip AI for non-applicable studies (e.g., male-only or wrong age range)
+            if str(study.get('applicable', 'TRUE')).upper() == 'FALSE':
+                for col in columns:
+                    col_name = col.get('name')
+                    if col_name not in study:
+                        study[col_name] = 'N/A'
+                processed_studies.append(study)
+                continue
+                
+            if new_processed_count >= max_new_calls:
+                remaining_studies.append(study)
+                continue
+                
+            print(f"  [{new_processed_count+1}/{max_new_calls} new] Processing {nct_id}...", end=' ', flush=True)
+            
+            study_ai_vals = {}
+            for col in columns:
+                col_name = col.get('name')
+                model = models[col_name]
+                ai_value = process_study_with_ai(model, study)
+ 
+                # If we get None, then backoff and retry before we skip this one and move to the
+                # next one.
+                if ai_value is None:
+                    print("Retrying AI call")
+                    api_delay = ai_config.get('api_delay', 0.5)
+                    if api_delay > 0:
+                        time.sleep(2*api_delay)
+                    ai_value = process_study_with_ai(model, study)
+                
+                if ai_value is None:
+                    # Assumes None means API error/timeout/quota
+                    print("⚠️ Quota Exceeded or API Error! Omitting AI processing.")
+                    study[col_name] = "N/A"
+                    study_ai_vals[col_name] = "N/A"
+                else:
+                    print(f"\n\t{col_name} - ✓")
+                    study[col_name] = ai_value
+                    study_ai_vals[col_name] = ai_value
+            
+            if study_ai_vals:
+                existing_ai_data[nct_id] = study_ai_vals
+                
+            processed_studies.append(study)
+            new_processed_count += 1
+            
+    except KeyboardInterrupt:
+        print(f"\n⚠️ User interrupted! Saving {len(processed_studies)} processed studies so far to JSON...")
+        # Move remaining to remaining_studies
+        remaining_studies.extend(studies[len(processed_studies) + len(remaining_studies):])
         
-        all_success = True
-        for col in columns:
-            col_name = col.get('name')
-            if (not col_name):
-                print(f"❌ Column name is required. Column: {col}")
-                sys.exit(1)
-
-            model = models[col_name]
-            ai_value = process_study_with_ai(model, study)
-            study[col_name] = ai_value
+        # Add remaining studies to processed_studies list as unprocessed ('N/A')
+        for study in remaining_studies:
+            for col in columns:
+                col_name = col.get('name')
+                if col_name not in study:
+                    study[col_name] = 'N/A'
+            processed_studies.append(study)
+            
+        save_to_json(processed_studies, json_filename)
         
-        print("✓")
-        
-        processed_studies.append(study)
+        if use_cache:
+            try:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(existing_ai_data, f, indent=2, ensure_ascii=False)
+                print(f"💾 Updated AI cache saved to {cache_file}")
+            except Exception as e:
+                print(f"❌ Failed to save AI cache: {e}")
+                
+        print("💾 In-progress progress saved. Terminating pipeline.")
+        sys.exit(0)
     
     # Add remaining studies without AI transformation
     for study in remaining_studies:
         for col in columns:
             col_name = col.get('name')
-            study[col_name] = 'N/A'
+            if col_name not in study:
+                study[col_name] = 'N/A'
         processed_studies.append(study)
     
     print(f"\n✅ AI transformation complete:")
-    print(f"   Processed with AI: {len(studies_to_process)} studies")
+    print(f"   Resumed from cache: {len(processed_studies) - len(remaining_studies) - new_processed_count} studies")
+    print(f"   New Processed with AI: {new_processed_count} studies")
     if remaining_studies:
         print(f"   Remaining {len(remaining_studies)} studies set to 'N/A'")
+        
+    if use_cache:
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(existing_ai_data, f, indent=2, ensure_ascii=False)
+            print(f"💾 Updated AI cache saved to {cache_file}")
+        except Exception as e:
+            print(f"❌ Failed to save AI cache: {e}")
     
     return processed_studies
 
@@ -1267,6 +2239,25 @@ def transform_studies_with_ai(studies: List[Dict[str, Any]]) -> List[Dict[str, A
 # ============================================================================
 # LOAD - Functions that save data to output destinations
 # ============================================================================
+
+def save_to_json(studies: List[Dict[str, Any]], filename: str) -> None:
+    """
+    Save studies list to a JSON file.
+    
+    Args:
+        studies (List[Dict[str, Any]]): List of study data dictionaries
+        filename (str): Target JSON filename
+    """
+    if not studies:
+        print("No studies to save to JSON")
+        return
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(studies, f, indent=2, ensure_ascii=False)
+        print(f"💾 Data saved to JSON: {filename} ({len(studies)} rows)")
+    except Exception as e:
+        print(f"❌ Failed to save JSON: {e}")
+
 
 def load_to_csv(studies: List[Dict[str, Any]], filename: Optional[str] = None) -> None:
     """
@@ -1287,16 +2278,19 @@ def load_to_csv(studies: List[Dict[str, Any]], filename: Optional[str] = None) -
     # Base fieldnames
     fieldnames = [
         'nct_id', 'brief_title', 'official_title', 'conditions', 'overall_status',
-        'minimum_age', 'maximum_age', 'study_type', 'start_date',
+        'minimum_age', 'maximum_age', 'Applicable', 'study_type', 'start_date',
+        'primary_completion_date', 'completion_date', 'first_posted_date', 'last_update_date',
         'gender', 'healthy_volunteers', 'brief_summary', 'detailed_description', 'criteria',
-        'start_year', 'location', 'phase', 'enrollment', 'results_link',
+        'start_year', 'location', 'sites_detail', 'sites_cities', 'sites_provinces', 'site_count_type', 'has_canadian_site', 'phase', 'enrollment', 'results_link',
         'publications', 'pubmed_publications',
         'intervention_types', 'intervention_names', 'intervention_descriptions',
         'primary_outcomes', 'secondary_outcomes',
         'allocation', 'intervention_model', 'primary_purpose', 'masking', 'arm_groups',
         'funder_info', 'lead_sponsor', 'lead_sponsor_class', 'collaborators',
         'Health Canada Approval', 'FDA Approved Status', 'Approval Consistency', 'FDA Pregnancy & Lactation Safety',
-        'FDA Pregnancy Status', 'FDA Lactation Status', 'Cited in FDA Label'
+        'FDA Pregnancy Status', 'FDA Lactation Status', 'Cited in FDA Label', 'Approved Before Trial', 'OpenFDA Pharmacologic Class (EPC)',
+        'OpenFDA Pharmacologic Class (PE)',
+        'ICD-11 Primary Code', 'ICD-11 Primary Title', 'ICD-11 Block', 'ICD-11 Category', 'ICD-11 Secondary Codes'
     ]
     
     # Add all AI columns from config
@@ -1354,43 +2348,92 @@ def main():
     print("ClinicalTrials.gov ETL - Data Fetcher with Gemini AI")
     print("="*60)
     
-    # EXTRACT: Fetch all studies from API
-    study_data = extract_clinical_trials()
-    
-    if not study_data:
-        print("❌ Failed to extract data from API")
-        sys.exit(1)
-    
-    # TRANSFORM: Transform raw studies to structured format
-    raw_studies = study_data.get('studies', [])
-    print(f"\n📊 Found {len(raw_studies)} total studies")
-
-    # Limit processing if max_rows is set
-    ai_config = CONFIG.get('ai_processing', {})
-    if ai_config.get('debug_only_tuning_trials', False):
-        tuning_trials = set(CONFIG.get('tuning_trials', []))
-        raw_studies = [s for s in raw_studies if s.get('protocolSection', {}).get('identificationModule', {}).get('nctId') in tuning_trials]
-        print(f"🔍 Debug mode: Filtered to {len(raw_studies)} tuning trials")
-    elif ai_config.get('max_rows') is not None:
-        raw_studies = raw_studies[:ai_config.get('max_rows')]
-        print(f"📊 Limited to first {ai_config.get('max_rows')} studies for testing")
+    resume_from_csv = CONFIG.get('ctgov', {}).get('resume_from_csv', False)
+    output_config = CONFIG.get('output', {})
+    filename = output_config.get('csv_filename', 'clinical_trials_filtered.csv')
+    json_filename = output_config.get('json_filename')
+    if not json_filename:
+        json_filename = os.path.splitext(filename)[0] + '.json'
     
     transformed_studies = []
-    for i, study in enumerate(raw_studies):
-        if i % 10 == 0:
-            print(f"Transforming study {i+1}/{len(raw_studies)}...")
-        transformed_studies.append(transform_study_data(study))
-
     
-    if not transformed_studies:
-        print("❌ No studies after transformation")
-        sys.exit(1)
+    if resume_from_csv:
+        if os.path.exists(json_filename):
+            print(f"\n📂 Resuming entirely from existing JSON: {json_filename}")
+            try:
+                with open(json_filename, 'r', encoding='utf-8') as f:
+                    transformed_studies = json.load(f)
+                print(f"📊 Loaded {len(transformed_studies)} studies directly from JSON")
+            except Exception as e:
+                print(f"❌ Failed to load JSON: {e}")
+                sys.exit(1)
+        elif os.path.exists(filename):
+            print(f"\n📂 Resuming entirely from existing CSV: {filename}")
+            try:
+                with open(filename, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    transformed_studies = [row for row in reader]
+                print(f"📊 Loaded {len(transformed_studies)} studies directly from CSV")
+            except Exception as e:
+                print(f"❌ Failed to load CSV: {e}")
+                sys.exit(1)
+        else:
+            print(f"❌ Resume enabled, but neither JSON nor CSV file exists: {json_filename} / {filename}")
+            sys.exit(1)
+            
+        # Apply row limits if needed
+        ai_config = CONFIG.get('ai_processing', {})
+        if ai_config.get('max_rows') is not None:
+            transformed_studies = transformed_studies[:ai_config.get('max_rows')]
+        
+        # Backfill missing OpenFDA Pharmacologic Class
+        print("🔄 Checking for missing OpenFDA Pharmacologic Class...")
+        for study in transformed_studies:
+            if not study.get('OpenFDA Pharmacologic Class (EPC)'):
+                intv_str = study.get('intervention_names', '')
+                if intv_str and intv_str != 'N/A':
+                    intv_list = [i.strip() for i in intv_str.split(',')]
+                    study['OpenFDA Pharmacologic Class (EPC)'] = fetch_openfda_pharm_class(intv_list)
+                else:
+                    study['OpenFDA Pharmacologic Class (EPC)'] = 'N/A'
+            
+    else:
+        # EXTRACT: Fetch all studies from API
+        study_data = extract_clinical_trials()
+        
+        if not study_data:
+            print("❌ Failed to extract data from API")
+            sys.exit(1)
+        
+        # TRANSFORM: Transform raw studies to structured format
+        raw_studies = study_data.get('studies', [])
+        print(f"\n📊 Found {len(raw_studies)} total studies")
+
+        # Limit processing if max_rows is set
+        ai_config = CONFIG.get('ai_processing', {})
+        if ai_config.get('debug_only_tuning_trials', False):
+            tuning_trials = set(CONFIG.get('tuning_trials', []))
+            raw_studies = [s for s in raw_studies if s.get('protocolSection', {}).get('identificationModule', {}).get('nctId') in tuning_trials]
+            print(f"🔍 Debug mode: Filtered to {len(raw_studies)} tuning trials")
+        elif ai_config.get('max_rows') is not None:
+            raw_studies = raw_studies[:ai_config.get('max_rows')]
+            print(f"📊 Limited to first {ai_config.get('max_rows')} studies for testing")
+        
+        for i, study in enumerate(raw_studies):
+            if i % 10 == 0:
+                print(f"Transforming study {i+1}/{len(raw_studies)}...")
+            transformed_studies.append(transform_study_data(study))
+
+        if not transformed_studies:
+            print("❌ No studies after transformation")
+            sys.exit(1)
     
     # TRANSFORM: Apply AI transformation
     transformed_studies = transform_studies_with_ai(transformed_studies)
     
-    # LOAD: Save transformed studies to CSV
-    load_to_csv(transformed_studies)
+    # LOAD: Save transformed studies to both JSON and CSV
+    save_to_json(transformed_studies, json_filename)
+    load_to_csv(transformed_studies, filename)
     
     print(f"\n✅ Successfully processed {len(transformed_studies)} studies")
 
